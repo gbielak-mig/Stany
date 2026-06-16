@@ -23,6 +23,8 @@ IMPORT_TS_COL = "load_ts_utc"
 DATE_COL      = "event_date"
 SHOP_COL      = "shop_name"
 INDEX_COL     = "index"
+VARIANTS_COL  = "variants"
+QUANTITY_COL  = "quantity"
 
 
 # ─────────────────────────────────────────
@@ -54,7 +56,7 @@ def parse_project(table: str) -> str:
 
 
 # ─────────────────────────────────────────
-# COST ESTIMATE (DRY RUN) – dla jednego okresu
+# COST ESTIMATE (DRY RUN)
 # ─────────────────────────────────────────
 
 def estimate_cost_single(table: str, start: date, end: date) -> dict:
@@ -72,7 +74,6 @@ def estimate_cost_single(table: str, start: date, end: date) -> dict:
 
 
 def estimate_cost_all(table: str, periods: list) -> dict:
-    """Sumuje dry run dla trzech osobnych zapytań."""
     total_gb   = 0
     total_cost = 0
     for start, end in periods:
@@ -85,12 +86,11 @@ def estimate_cost_all(table: str, periods: list) -> dict:
 
 
 # ─────────────────────────────────────────
-# LISTA SKLEPÓW – lekkie zapytanie przy starcie
+# LISTA SKLEPÓW
 # ─────────────────────────────────────────
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_shops(_creds_hash: str, table: str) -> list:
-    """Pobiera unikalną listę sklepów – bardzo małe zapytanie."""
     project = parse_project(table)
     client  = bigquery.Client(credentials=get_credentials(), project=project)
     query   = f"SELECT DISTINCT {SHOP_COL} FROM `{table}` ORDER BY {SHOP_COL}"
@@ -104,7 +104,7 @@ def fetch_shops(_creds_hash: str, table: str) -> list:
 # ─────────────────────────────────────────
 
 def build_query(table: str, start: date, end: date) -> str:
-    extra_cols = ", ".join([INDEX_COL] + CATEGORY_COLS)
+    extra_cols = ", ".join([INDEX_COL] + CATEGORY_COLS + [VARIANTS_COL, QUANTITY_COL])
     return f"""
     SELECT {SHOP_COL}, {DATE_COL}, {extra_cols}
     FROM `{table}`
@@ -114,7 +114,6 @@ def build_query(table: str, start: date, end: date) -> str:
 
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_period(_creds_hash: str, table: str, start: date, end: date) -> pd.DataFrame:
-    """Pobiera tylko jeden okres. Cache 10 min."""
     project = parse_project(table)
     client  = bigquery.Client(credentials=get_credentials(), project=project)
     job     = client.query(build_query(table, start, end))
@@ -125,10 +124,10 @@ def fetch_period(_creds_hash: str, table: str, start: date, end: date) -> pd.Dat
 
 
 # ─────────────────────────────────────────
-# ZAKRESY DAT – trzy okresy
+# ZAKRESY DAT
 # ─────────────────────────────────────────
 
-def get_periods(preset: str, custom_start: date = None, custom_end: date = None):
+def get_auto_periods(preset: str, custom_start: date = None, custom_end: date = None):
     if preset == "Ostatni tydzień":
         end   = YESTERDAY
         start = end - timedelta(6)
@@ -152,18 +151,16 @@ def get_periods(preset: str, custom_start: date = None, custom_end: date = None)
 
 
 # ─────────────────────────────────────────
-# AGREGACJA – unikalne indeksy w całym okresie
+# AGREGACJA
 # ─────────────────────────────────────────
 
 def count_products(df: pd.DataFrame) -> int:
-    """Liczba unikalnych indeksów produktów w okresie."""
     if INDEX_COL in df.columns:
         return df[INDEX_COL].nunique()
     return len(df)
 
 
 def build_summary(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
-    """Agregacja po kategorii – unikalne indeksy w całym okresie."""
     if group_col not in df.columns:
         return pd.DataFrame(columns=[group_col, "produkty"])
     if INDEX_COL in df.columns:
@@ -176,6 +173,21 @@ def build_summary(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
     else:
         out = df.groupby(group_col).size().reset_index(name="produkty")
     return out.sort_values("produkty", ascending=False)
+
+
+def build_variants_summary(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
+    """Agregacja variants i quantity po kategorii."""
+    if group_col not in df.columns:
+        return pd.DataFrame(columns=[group_col, "variants", "quantity"])
+    agg = {}
+    if VARIANTS_COL in df.columns:
+        agg[VARIANTS_COL] = "sum"
+    if QUANTITY_COL in df.columns:
+        agg[QUANTITY_COL] = "sum"
+    if not agg:
+        return pd.DataFrame(columns=[group_col])
+    out = df.groupby(group_col).agg(agg).reset_index()
+    return out.sort_values(list(agg.keys())[0], ascending=False)
 
 
 def compare_periods(df_cur, df_prev, group_col) -> pd.DataFrame:
@@ -191,6 +203,47 @@ def compare_periods(df_cur, df_prev, group_col) -> pd.DataFrame:
         axis=1,
     )
     return merged.sort_values("bieżący", ascending=False)
+
+
+def compare_variants_periods(df_cur, df_prev, group_col) -> pd.DataFrame:
+    """Porównanie variants i quantity między okresami."""
+    def agg_df(df):
+        cols = {}
+        if VARIANTS_COL in df.columns:
+            cols[VARIANTS_COL] = "sum"
+        if QUANTITY_COL in df.columns:
+            cols[QUANTITY_COL] = "sum"
+        if not cols or group_col not in df.columns:
+            return pd.DataFrame(columns=[group_col])
+        return df.groupby(group_col).agg(cols).reset_index()
+
+    cur  = agg_df(df_cur)
+    prev = agg_df(df_prev)
+
+    if cur.empty:
+        return cur
+
+    merged = cur.merge(prev, on=group_col, how="outer", suffixes=("_cur", "_prev")).fillna(0)
+
+    result = merged[[group_col]].copy()
+
+    for col in [VARIANTS_COL, QUANTITY_COL]:
+        col_cur  = f"{col}_cur"
+        col_prev = f"{col}_prev"
+        if col_cur in merged.columns:
+            merged[col_cur]  = merged[col_cur].astype(int)
+            merged[col_prev] = merged[col_prev].astype(int)
+            result[f"{col} (bież.)"]  = merged[col_cur]
+            result[f"{col} (poprz.)"] = merged[col_prev]
+            result[f"{col} zmiana"]   = merged[col_cur] - merged[col_prev]
+            result[f"{col} zmiana %"] = merged.apply(
+                lambda r: f"{(r[col_cur]-r[col_prev])/r[col_prev]*100:+.1f}%"
+                if r[col_prev] > 0 else ("nowe" if r[col_cur] > 0 else "–"),
+                axis=1,
+            )
+
+    sort_col = f"{VARIANTS_COL} (bież.)" if f"{VARIANTS_COL} (bież.)" in result.columns else result.columns[-1]
+    return result.sort_values(sort_col, ascending=False)
 
 
 # ─────────────────────────────────────────
@@ -212,6 +265,11 @@ div[data-testid="stSidebar"] { background: #111; border-right: 1px solid #222; }
 .cost-box strong { color: #ffd700; }
 .cost-box .label { font-size: 0.62rem; text-transform: uppercase; letter-spacing: 2px; color: #555; }
 .period-label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 2px; color: #666; margin-bottom: 2px; }
+.filter-tag {
+    display: inline-block; background: #1e2a1e; border: 1px solid #2ecc71;
+    border-radius: 4px; padding: 2px 8px; font-size: 0.72rem; color: #2ecc71;
+    margin: 2px 3px 2px 0;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -237,7 +295,7 @@ with st.sidebar:
     st.caption(f"📋 `{TABLE}`")
     st.markdown("---")
 
-    # ── Sklep – ładowany przy starcie osobnym zapytaniem ────────────────────
+    # ── Sklep ───────────────────────────────────────────────────────────────
     creds_hash = str(id(get_credentials()))
     try:
         shops_list = fetch_shops(creds_hash, TABLE)
@@ -253,6 +311,7 @@ with st.sidebar:
 
     st.markdown("---")
 
+    # ── Zakresy dat ─────────────────────────────────────────────────────────
     with st.expander("📅 Zakres dat", expanded=True):
         preset = st.radio(
             "Szybki wybór",
@@ -265,17 +324,41 @@ with st.sidebar:
         else:
             c_start = c_end = None
 
-    current, prev_week, prev_year = get_periods(preset, c_start, c_end)
-    n_days = (current[1] - current[0]).days + 1
+    auto_current, auto_prev_week, auto_prev_year = get_auto_periods(preset, c_start, c_end)
+
+    # ── Nadpisanie poprzedniego okresu ──────────────────────────────────────
+    with st.expander("🔁 Nadpisz: poprzedni okres"):
+        override_prev = st.checkbox("Ustaw ręcznie", key="override_prev")
+        if override_prev:
+            prev_start = st.date_input("Od##prev", auto_prev_week[0], key="prev_start")
+            prev_end   = st.date_input("Do##prev", auto_prev_week[1], key="prev_end")
+            prev_week  = (prev_start, prev_end)
+        else:
+            prev_week = auto_prev_week
+
+    # ── Nadpisanie roku wcześniej ────────────────────────────────────────────
+    with st.expander("📆 Nadpisz: rok wcześniej"):
+        override_year = st.checkbox("Ustaw ręcznie", key="override_year")
+        if override_year:
+            year_start = st.date_input("Od##year", auto_prev_year[0], key="year_start")
+            year_end   = st.date_input("Do##year", auto_prev_year[1], key="year_end")
+            prev_year  = (year_start, year_end)
+        else:
+            prev_year = auto_prev_year
+
+    current = auto_current
+    n_days  = (current[1] - current[0]).days + 1
 
     st.caption(
         f"**Bieżący:** {current[0]} → {current[1]} ({n_days} dni)\n\n"
-        f"**Poprzedni:** {prev_week[0]} → {prev_week[1]}\n\n"
+        f"**Poprzedni:** {prev_week[0]} → {prev_week[1]}"
+        + (" ✏️" if override_prev else "") + "\n\n"
         f"**Rok wcześniej:** {prev_year[0]} → {prev_year[1]}"
+        + (" ✏️" if override_year else "")
     )
     st.markdown("---")
 
-    # Dry run – trzy osobne zapytania
+    # ── Dry run ─────────────────────────────────────────────────────────────
     est = estimate_cost_all(TABLE, [current, prev_week, prev_year])
     if est["ok"]:
         color = "#2ecc71" if est["cost_usd"] < 0.01 else "#ffd700" if est["cost_usd"] < 0.10 else "#ff9f4d"
@@ -337,14 +420,12 @@ if selected_shop is None:
     st.stop()
 
 # ── Filtrowanie po sklepie ───────────────────────────────────────────────────
-df_cur_s  = df_cur[df_cur[SHOP_COL]   == selected_shop]
-df_prev_s = df_prev[df_prev[SHOP_COL] == selected_shop]
-df_year_s = df_year[df_year[SHOP_COL] == selected_shop]
+df_cur_s  = df_cur[df_cur[SHOP_COL]   == selected_shop].copy()
+df_prev_s = df_prev[df_prev[SHOP_COL] == selected_shop].copy()
+df_year_s = df_year[df_year[SHOP_COL] == selected_shop].copy()
 
 # ── Metryki główne ───────────────────────────────────────────────────────────
 st.markdown("### 📦 Liczba produktów")
-
-c1, c2, c3 = st.columns(3)
 
 def delta_str(cur_val, prev_val):
     if prev_val == 0:
@@ -357,6 +438,7 @@ n_cur  = count_products(df_cur_s)
 n_prev = count_products(df_prev_s)
 n_year = count_products(df_year_s)
 
+c1, c2, c3 = st.columns(3)
 with c1:
     st.markdown('<div class="period-label">Bieżący okres</div>', unsafe_allow_html=True)
     st.metric(f"{current[0]} → {current[1]}", f"{n_cur:,}", delta=delta_str(n_cur, n_prev))
@@ -369,7 +451,9 @@ with c3:
 
 st.markdown("---")
 
-# ── Filtr kategorii ──────────────────────────────────────────────────────────
+# ─────────────────────────────────────────
+# ANALIZA KATEGORII
+# ─────────────────────────────────────────
 st.markdown("### 🔍 Analiza kategorii")
 
 available_cats = [c for c in CATEGORY_COLS if c in df_cur.columns]
@@ -379,33 +463,175 @@ if not available_cats:
 
 group_col = st.selectbox("Kategoria", available_cats)
 
-tab1, tab2 = st.tabs(["📊 Bieżący vs poprzedni tydzień", "📅 Bieżący vs rok wcześniej"])
+# ── Filtry dynamiczne ────────────────────────────────────────────────────────
+st.markdown("#### 🎛️ Filtry")
 
-def styled_df(cmp):
-    return cmp.style.apply(
-        lambda col: [
-            "color: #2ecc71" if str(v).startswith("+") else
-            "color: #e74c3c" if str(v).startswith("-") else ""
-            for v in col
-        ] if col.name == "zmiana %" else [""] * len(col),
-        axis=0,
-    )
+filter_cols = [c for c in CATEGORY_COLS if c in df_cur_s.columns] + (
+    [DATE_COL] if DATE_COL in df_cur_s.columns else []
+)
+# Usuń aktualnie wybraną kategorię z filtrów (żeby nie dublować)
+filter_cols = [c for c in filter_cols if c != group_col]
 
-with tab1:
-    cmp = compare_periods(df_cur_s, df_prev_s, group_col)
-    st.markdown(f"**{selected_shop}** · `{group_col}` · {current[0]}→{current[1]} vs {prev_week[0]}→{prev_week[1]}")
-    st.dataframe(styled_df(cmp), use_container_width=True, height=420)
+active_filters = {}
+if filter_cols:
+    n_filter_cols = min(len(filter_cols), 4)
+    fcols = st.columns(n_filter_cols)
+    for i, fc in enumerate(filter_cols):
+        with fcols[i % n_filter_cols]:
+            if fc == DATE_COL:
+                unique_vals = sorted(df_cur_s[fc].dropna().unique().tolist())
+                selected = st.multiselect(
+                    f"📅 {fc}",
+                    options=unique_vals,
+                    default=[],
+                    key=f"filter_{fc}",
+                    placeholder="Wszystkie daty",
+                )
+            else:
+                unique_vals = sorted(df_cur_s[fc].dropna().unique().tolist())
+                selected = st.multiselect(
+                    f"🏷️ {fc}",
+                    options=unique_vals,
+                    default=[],
+                    key=f"filter_{fc}",
+                    placeholder="Wszystkie",
+                )
+            if selected:
+                active_filters[fc] = selected
 
-with tab2:
-    cmp_yr = compare_periods(df_cur_s, df_year_s, group_col)
-    st.markdown(f"**{selected_shop}** · `{group_col}` · {current[0]}→{current[1]} vs {prev_year[0]}→{prev_year[1]}")
-    st.dataframe(styled_df(cmp_yr), use_container_width=True, height=420)
+# ── Zastosuj filtry ──────────────────────────────────────────────────────────
+def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
+    for col, vals in filters.items():
+        if col in df.columns and vals:
+            df = df[df[col].isin(vals)]
+    return df
+
+df_cur_f  = apply_filters(df_cur_s.copy(),  active_filters)
+df_prev_f = apply_filters(df_prev_s.copy(), active_filters)
+df_year_f = apply_filters(df_year_s.copy(), active_filters)
+
+# ── Pokaż aktywne filtry ─────────────────────────────────────────────────────
+if active_filters:
+    tags_html = ""
+    for col, vals in active_filters.items():
+        for v in vals:
+            tags_html += f'<span class="filter-tag">{col}: {v}</span>'
+    st.markdown(f"**Aktywne filtry:** {tags_html}", unsafe_allow_html=True)
+    st.caption(f"Wiersze po filtrach: {len(df_cur_f):,} z {len(df_cur_s):,} bieżącego okresu")
+
+st.markdown("---")
+
+# ─────────────────────────────────────────
+# BOOK: Produkty / Variants & Quantity
+# ─────────────────────────────────────────
+
+book_tab1, book_tab2 = st.tabs(["📦 Produkty (indeksy)", "🔢 Variants & Quantity"])
+
+# ── BOOK 1: Produkty ─────────────────────────────────────────────────────────
+with book_tab1:
+    tab1, tab2 = st.tabs(["📊 Bieżący vs poprzedni", "📅 Bieżący vs rok wcześniej"])
+
+    def styled_df(cmp):
+        return cmp.style.apply(
+            lambda col: [
+                "color: #2ecc71" if str(v).startswith("+") else
+                "color: #e74c3c" if str(v).startswith("-") else ""
+                for v in col
+            ] if col.name == "zmiana %" else [""] * len(col),
+            axis=0,
+        )
+
+    with tab1:
+        cmp = compare_periods(df_cur_f, df_prev_f, group_col)
+        st.markdown(
+            f"**{selected_shop}** · `{group_col}` · "
+            f"{current[0]}→{current[1]} vs {prev_week[0]}→{prev_week[1]}"
+        )
+        st.dataframe(styled_df(cmp), use_container_width=True, height=420)
+
+    with tab2:
+        cmp_yr = compare_periods(df_cur_f, df_year_f, group_col)
+        st.markdown(
+            f"**{selected_shop}** · `{group_col}` · "
+            f"{current[0]}→{current[1]} vs {prev_year[0]}→{prev_year[1]}"
+        )
+        st.dataframe(styled_df(cmp_yr), use_container_width=True, height=420)
+
+# ── BOOK 2: Variants & Quantity ──────────────────────────────────────────────
+with book_tab2:
+    has_variants = VARIANTS_COL in df_cur_s.columns
+    has_quantity = QUANTITY_COL in df_cur_s.columns
+
+    if not has_variants and not has_quantity:
+        st.warning(f"Brak kolumn `{VARIANTS_COL}` i `{QUANTITY_COL}` w danych.")
+    else:
+        # Metryki ogólne variants & quantity
+        m1, m2, m3, m4 = st.columns(4)
+        if has_variants:
+            v_cur  = int(df_cur_f[VARIANTS_COL].sum())  if has_variants else 0
+            v_prev = int(df_prev_f[VARIANTS_COL].sum()) if has_variants else 0
+            v_year = int(df_year_f[VARIANTS_COL].sum()) if has_variants else 0
+            with m1:
+                st.markdown('<div class="period-label">Variants (bież.)</div>', unsafe_allow_html=True)
+                st.metric("", f"{v_cur:,}", delta=delta_str(v_cur, v_prev))
+            with m2:
+                st.markdown('<div class="period-label">Variants (poprz.)</div>', unsafe_allow_html=True)
+                st.metric("", f"{v_prev:,}")
+
+        if has_quantity:
+            q_cur  = int(df_cur_f[QUANTITY_COL].sum())
+            q_prev = int(df_prev_f[QUANTITY_COL].sum())
+            q_year = int(df_year_f[QUANTITY_COL].sum())
+            with m3:
+                st.markdown('<div class="period-label">Quantity (bież.)</div>', unsafe_allow_html=True)
+                st.metric("", f"{q_cur:,}", delta=delta_str(q_cur, q_prev))
+            with m4:
+                st.markdown('<div class="period-label">Quantity (poprz.)</div>', unsafe_allow_html=True)
+                st.metric("", f"{q_prev:,}")
+
+        st.markdown("---")
+
+        vq_tab1, vq_tab2 = st.tabs(["📊 Bieżący vs poprzedni", "📅 Bieżący vs rok wcześniej"])
+
+        def styled_vq(df):
+            pct_cols = [c for c in df.columns if "zmiana %" in c]
+            def color_col(col):
+                if col.name in pct_cols:
+                    return [
+                        "color: #2ecc71" if str(v).startswith("+") else
+                        "color: #e74c3c" if str(v).startswith("-") else ""
+                        for v in col
+                    ]
+                return [""] * len(col)
+            return df.style.apply(color_col, axis=0)
+
+        with vq_tab1:
+            cmp_vq = compare_variants_periods(df_cur_f, df_prev_f, group_col)
+            st.markdown(
+                f"**{selected_shop}** · `{group_col}` · "
+                f"{current[0]}→{current[1]} vs {prev_week[0]}→{prev_week[1]}"
+            )
+            if cmp_vq.empty:
+                st.info("Brak danych.")
+            else:
+                st.dataframe(styled_vq(cmp_vq), use_container_width=True, height=420)
+
+        with vq_tab2:
+            cmp_vq_yr = compare_variants_periods(df_cur_f, df_year_f, group_col)
+            st.markdown(
+                f"**{selected_shop}** · `{group_col}` · "
+                f"{current[0]}→{current[1]} vs {prev_year[0]}→{prev_year[1]}"
+            )
+            if cmp_vq_yr.empty:
+                st.info("Brak danych.")
+            else:
+                st.dataframe(styled_vq(cmp_vq_yr), use_container_width=True, height=420)
 
 # ── Eksport ──────────────────────────────────────────────────────────────────
 st.markdown("---")
-csv = df_cur_s.to_csv(index=False).encode("utf-8")
+csv = df_cur_f.to_csv(index=False).encode("utf-8")
 st.download_button(
-    "⬇️ Pobierz bieżący okres CSV",
+    "⬇️ Pobierz bieżący okres CSV (z filtrami)",
     data=csv,
     file_name=f"bq_{selected_shop}_{current[0]}_{current[1]}.csv",
     mime="text/csv",
