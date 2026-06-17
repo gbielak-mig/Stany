@@ -155,12 +155,21 @@ def get_auto_periods(preset: str, custom_start: date = None, custom_end: date = 
 # ─────────────────────────────────────────
 
 def count_products(df: pd.DataFrame) -> int:
+    """Liczba unikalnych indeksów produktów w okresie."""
     if INDEX_COL in df.columns:
         return df[INDEX_COL].nunique()
     return len(df)
 
 
+def sum_col(df: pd.DataFrame, col: str) -> int:
+    """Prosta suma kolumny (variants / quantity), niezależnie od unikalności produktu."""
+    if col in df.columns:
+        return int(df[col].sum())
+    return 0
+
+
 def build_summary(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
+    """Agregacja po kategorii – unikalne indeksy produktów w całym okresie."""
     if group_col not in df.columns:
         return pd.DataFrame(columns=[group_col, "produkty"])
     if INDEX_COL in df.columns:
@@ -176,9 +185,13 @@ def build_summary(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
 
 
 def build_variants_summary(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
-    """Agregacja variants i quantity po kategorii."""
+    """
+    Agregacja variants i quantity po kategorii – proste sumy, BEZ liczenia
+    unikalnych produktów (jeśli produkt XXXX ma quantity=100 i variants=2,
+    sumujemy te wartości tak jak są, niezależnie od liczby wierszy).
+    """
     if group_col not in df.columns:
-        return pd.DataFrame(columns=[group_col, "variants", "quantity"])
+        return pd.DataFrame(columns=[group_col])
     agg = {}
     if VARIANTS_COL in df.columns:
         agg[VARIANTS_COL] = "sum"
@@ -187,7 +200,8 @@ def build_variants_summary(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
     if not agg:
         return pd.DataFrame(columns=[group_col])
     out = df.groupby(group_col).agg(agg).reset_index()
-    return out.sort_values(list(agg.keys())[0], ascending=False)
+    sort_col = list(agg.keys())[0]
+    return out.sort_values(sort_col, ascending=False)
 
 
 def compare_periods(df_cur, df_prev, group_col) -> pd.DataFrame:
@@ -206,19 +220,9 @@ def compare_periods(df_cur, df_prev, group_col) -> pd.DataFrame:
 
 
 def compare_variants_periods(df_cur, df_prev, group_col) -> pd.DataFrame:
-    """Porównanie variants i quantity między okresami."""
-    def agg_df(df):
-        cols = {}
-        if VARIANTS_COL in df.columns:
-            cols[VARIANTS_COL] = "sum"
-        if QUANTITY_COL in df.columns:
-            cols[QUANTITY_COL] = "sum"
-        if not cols or group_col not in df.columns:
-            return pd.DataFrame(columns=[group_col])
-        return df.groupby(group_col).agg(cols).reset_index()
-
-    cur  = agg_df(df_cur)
-    prev = agg_df(df_prev)
+    """Porównanie sum variants i quantity między okresami, per kategoria."""
+    cur  = build_variants_summary(df_cur,  group_col)
+    prev = build_variants_summary(df_prev, group_col)
 
     if cur.empty:
         return cur
@@ -424,8 +428,54 @@ df_cur_s  = df_cur[df_cur[SHOP_COL]   == selected_shop].copy()
 df_prev_s = df_prev[df_prev[SHOP_COL] == selected_shop].copy()
 df_year_s = df_year[df_year[SHOP_COL] == selected_shop].copy()
 
+# ─────────────────────────────────────────
+# FILTRY (rozwijane listy, wszystkie zmienne)
+# ─────────────────────────────────────────
+st.markdown("### 🎛️ Filtry")
+
+ALL_FILTER_COLS = CATEGORY_COLS + [DATE_COL]
+filter_cols = [c for c in ALL_FILTER_COLS if c in df_cur_s.columns]
+
+active_filters = {}
+if filter_cols:
+    n_filter_cols = min(len(filter_cols), 5)
+    fcols = st.columns(n_filter_cols)
+    for i, fc in enumerate(filter_cols):
+        with fcols[i % n_filter_cols]:
+            icon = "📅" if fc == DATE_COL else "🏷️"
+            unique_vals = sorted(df_cur_s[fc].dropna().unique().tolist())
+            selected = st.selectbox(
+                f"{icon} {fc}",
+                options=["(wszystkie)"] + unique_vals,
+                index=0,
+                key=f"filter_{fc}",
+            )
+            if selected != "(wszystkie)":
+                active_filters[fc] = selected
+
+# ── Zastosuj filtry ──────────────────────────────────────────────────────────
+def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
+    for col, val in filters.items():
+        if col in df.columns:
+            df = df[df[col] == val]
+    return df
+
+df_cur_f  = apply_filters(df_cur_s.copy(),  active_filters)
+df_prev_f = apply_filters(df_prev_s.copy(), active_filters)
+df_year_f = apply_filters(df_year_s.copy(), active_filters)
+
+# ── Pokaż aktywne filtry ─────────────────────────────────────────────────────
+if active_filters:
+    tags_html = "".join(
+        f'<span class="filter-tag">{col}: {val}</span>' for col, val in active_filters.items()
+    )
+    st.markdown(f"**Aktywne filtry:** {tags_html}", unsafe_allow_html=True)
+    st.caption(f"Wiersze po filtrach: {len(df_cur_f):,} z {len(df_cur_s):,} bieżącego okresu")
+
+st.markdown("---")
+
 # ── Metryki główne ───────────────────────────────────────────────────────────
-st.markdown("### 📦 Liczba produktów")
+st.markdown("### 📦 Podsumowanie okresu")
 
 def delta_str(cur_val, prev_val):
     if prev_val == 0:
@@ -434,20 +484,44 @@ def delta_str(cur_val, prev_val):
     pct = d / prev_val * 100
     return f"{d:+,} ({pct:+.1f}%)"
 
-n_cur  = count_products(df_cur_s)
-n_prev = count_products(df_prev_s)
-n_year = count_products(df_year_s)
+n_cur  = count_products(df_cur_f)
+n_prev = count_products(df_prev_f)
+n_year = count_products(df_year_f)
 
-c1, c2, c3 = st.columns(3)
-with c1:
-    st.markdown('<div class="period-label">Bieżący okres</div>', unsafe_allow_html=True)
-    st.metric(f"{current[0]} → {current[1]}", f"{n_cur:,}", delta=delta_str(n_cur, n_prev))
-with c2:
-    st.markdown('<div class="period-label">Poprzedni okres</div>', unsafe_allow_html=True)
-    st.metric(f"{prev_week[0]} → {prev_week[1]}", f"{n_prev:,}")
-with c3:
-    st.markdown('<div class="period-label">Rok wcześniej</div>', unsafe_allow_html=True)
-    st.metric(f"{prev_year[0]} → {prev_year[1]}", f"{n_year:,}", delta=delta_str(n_cur, n_year))
+v_cur  = sum_col(df_cur_f,  VARIANTS_COL)
+v_prev = sum_col(df_prev_f, VARIANTS_COL)
+v_year = sum_col(df_year_f, VARIANTS_COL)
+
+q_cur  = sum_col(df_cur_f,  QUANTITY_COL)
+q_prev = sum_col(df_prev_f, QUANTITY_COL)
+q_year = sum_col(df_year_f, QUANTITY_COL)
+
+st.markdown('<div class="period-label">Bieżący okres</div>', unsafe_allow_html=True)
+r1c1, r1c2, r1c3 = st.columns(3)
+with r1c1:
+    st.metric(f"📦 Produkty · {current[0]} → {current[1]}", f"{n_cur:,}", delta=delta_str(n_cur, n_prev))
+with r1c2:
+    st.metric("🔢 Variants", f"{v_cur:,}", delta=delta_str(v_cur, v_prev))
+with r1c3:
+    st.metric("📊 Quantity", f"{q_cur:,}", delta=delta_str(q_cur, q_prev))
+
+st.markdown('<div class="period-label" style="margin-top:14px">Poprzedni okres</div>', unsafe_allow_html=True)
+r2c1, r2c2, r2c3 = st.columns(3)
+with r2c1:
+    st.metric(f"📦 Produkty · {prev_week[0]} → {prev_week[1]}", f"{n_prev:,}")
+with r2c2:
+    st.metric("🔢 Variants", f"{v_prev:,}")
+with r2c3:
+    st.metric("📊 Quantity", f"{q_prev:,}")
+
+st.markdown('<div class="period-label" style="margin-top:14px">Rok wcześniej</div>', unsafe_allow_html=True)
+r3c1, r3c2, r3c3 = st.columns(3)
+with r3c1:
+    st.metric(f"📦 Produkty · {prev_year[0]} → {prev_year[1]}", f"{n_year:,}", delta=delta_str(n_cur, n_year))
+with r3c2:
+    st.metric("🔢 Variants", f"{v_year:,}", delta=delta_str(v_cur, v_year))
+with r3c3:
+    st.metric("📊 Quantity", f"{q_year:,}", delta=delta_str(q_cur, q_year))
 
 st.markdown("---")
 
@@ -461,71 +535,13 @@ if not available_cats:
     st.warning("Brak kolumn kategorii w danych.")
     st.stop()
 
-group_col = st.selectbox("Kategoria", available_cats)
-
-# ── Filtry dynamiczne ────────────────────────────────────────────────────────
-st.markdown("#### 🎛️ Filtry")
-
-filter_cols = [c for c in CATEGORY_COLS if c in df_cur_s.columns] + (
-    [DATE_COL] if DATE_COL in df_cur_s.columns else []
-)
-# Usuń aktualnie wybraną kategorię z filtrów (żeby nie dublować)
-filter_cols = [c for c in filter_cols if c != group_col]
-
-active_filters = {}
-if filter_cols:
-    n_filter_cols = min(len(filter_cols), 4)
-    fcols = st.columns(n_filter_cols)
-    for i, fc in enumerate(filter_cols):
-        with fcols[i % n_filter_cols]:
-            if fc == DATE_COL:
-                unique_vals = sorted(df_cur_s[fc].dropna().unique().tolist())
-                selected = st.multiselect(
-                    f"📅 {fc}",
-                    options=unique_vals,
-                    default=[],
-                    key=f"filter_{fc}",
-                    placeholder="Wszystkie daty",
-                )
-            else:
-                unique_vals = sorted(df_cur_s[fc].dropna().unique().tolist())
-                selected = st.multiselect(
-                    f"🏷️ {fc}",
-                    options=unique_vals,
-                    default=[],
-                    key=f"filter_{fc}",
-                    placeholder="Wszystkie",
-                )
-            if selected:
-                active_filters[fc] = selected
-
-# ── Zastosuj filtry ──────────────────────────────────────────────────────────
-def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
-    for col, vals in filters.items():
-        if col in df.columns and vals:
-            df = df[df[col].isin(vals)]
-    return df
-
-df_cur_f  = apply_filters(df_cur_s.copy(),  active_filters)
-df_prev_f = apply_filters(df_prev_s.copy(), active_filters)
-df_year_f = apply_filters(df_year_s.copy(), active_filters)
-
-# ── Pokaż aktywne filtry ─────────────────────────────────────────────────────
-if active_filters:
-    tags_html = ""
-    for col, vals in active_filters.items():
-        for v in vals:
-            tags_html += f'<span class="filter-tag">{col}: {v}</span>'
-    st.markdown(f"**Aktywne filtry:** {tags_html}", unsafe_allow_html=True)
-    st.caption(f"Wiersze po filtrach: {len(df_cur_f):,} z {len(df_cur_s):,} bieżącego okresu")
-
-st.markdown("---")
+group_col = st.selectbox("Kategoria do analizy", available_cats)
 
 # ─────────────────────────────────────────
 # BOOK: Produkty / Variants & Quantity
 # ─────────────────────────────────────────
 
-book_tab1, book_tab2 = st.tabs(["📦 Produkty (indeksy)", "🔢 Variants & Quantity"])
+book_tab1, book_tab2 = st.tabs(["📦 Produkty (unikalne indeksy)", "🔢 Variants & Quantity (suma)"])
 
 # ── BOOK 1: Produkty ─────────────────────────────────────────────────────────
 with book_tab1:
@@ -557,7 +573,7 @@ with book_tab1:
         )
         st.dataframe(styled_df(cmp_yr), use_container_width=True, height=420)
 
-# ── BOOK 2: Variants & Quantity ──────────────────────────────────────────────
+# ── BOOK 2: Variants & Quantity (proste sumy) ────────────────────────────────
 with book_tab2:
     has_variants = VARIANTS_COL in df_cur_s.columns
     has_quantity = QUANTITY_COL in df_cur_s.columns
@@ -565,31 +581,7 @@ with book_tab2:
     if not has_variants and not has_quantity:
         st.warning(f"Brak kolumn `{VARIANTS_COL}` i `{QUANTITY_COL}` w danych.")
     else:
-        # Metryki ogólne variants & quantity
-        m1, m2, m3, m4 = st.columns(4)
-        if has_variants:
-            v_cur  = int(df_cur_f[VARIANTS_COL].sum())  if has_variants else 0
-            v_prev = int(df_prev_f[VARIANTS_COL].sum()) if has_variants else 0
-            v_year = int(df_year_f[VARIANTS_COL].sum()) if has_variants else 0
-            with m1:
-                st.markdown('<div class="period-label">Variants (bież.)</div>', unsafe_allow_html=True)
-                st.metric("", f"{v_cur:,}", delta=delta_str(v_cur, v_prev))
-            with m2:
-                st.markdown('<div class="period-label">Variants (poprz.)</div>', unsafe_allow_html=True)
-                st.metric("", f"{v_prev:,}")
-
-        if has_quantity:
-            q_cur  = int(df_cur_f[QUANTITY_COL].sum())
-            q_prev = int(df_prev_f[QUANTITY_COL].sum())
-            q_year = int(df_year_f[QUANTITY_COL].sum())
-            with m3:
-                st.markdown('<div class="period-label">Quantity (bież.)</div>', unsafe_allow_html=True)
-                st.metric("", f"{q_cur:,}", delta=delta_str(q_cur, q_prev))
-            with m4:
-                st.markdown('<div class="period-label">Quantity (poprz.)</div>', unsafe_allow_html=True)
-                st.metric("", f"{q_prev:,}")
-
-        st.markdown("---")
+        st.caption("Sumy `variants` i `quantity` per kategoria — nie liczba unikalnych produktów, tylko suma wartości z kolumn.")
 
         vq_tab1, vq_tab2 = st.tabs(["📊 Bieżący vs poprzedni", "📅 Bieżący vs rok wcześniej"])
 
