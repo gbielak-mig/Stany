@@ -162,14 +162,14 @@ def count_products(df: pd.DataFrame) -> int:
 
 
 def sum_col(df: pd.DataFrame, col: str) -> int:
-    """Prosta suma kolumny (variants / quantity), niezależnie od unikalności produktu."""
+    """Prosta suma kolumny (variants / quantity)."""
     if col in df.columns:
         return int(df[col].sum())
     return 0
 
 
 def build_summary(df: pd.DataFrame, group_col: str, active_filters: dict) -> pd.DataFrame:
-    """Agregacja po kategorii – unikalne indeksy produktów w całym okresie + kolumny filtrów."""
+    """Agregacja po kategorii – unikalne indeksy produktów + kolumny filtrów."""
     if group_col not in df.columns:
         return pd.DataFrame(columns=[group_col, "produkty"])
     
@@ -189,9 +189,7 @@ def build_summary(df: pd.DataFrame, group_col: str, active_filters: dict) -> pd.
 
 
 def build_variants_summary(df: pd.DataFrame, group_col: str, active_filters: dict) -> pd.DataFrame:
-    """
-    Agregacja variants i quantity po kategorii – proste sumy + kolumny filtrów.
-    """
+    """Agregacja variants i quantity po kategorii – proste sumy + kolumny filtrów."""
     if group_col not in df.columns:
         return pd.DataFrame(columns=[group_col])
     
@@ -383,6 +381,12 @@ with st.sidebar:
     )
     st.markdown("---")
 
+    # ── Filtry kategorii (będą dostępne po załadowaniu) ────────────────────
+    st.markdown("#### 🎛️ Filtry")
+    st.caption("*Dostępne po załadowaniu danych*")
+
+    st.markdown("---")
+
     # ── Dry run ─────────────────────────────────────────────────────────────
     est = estimate_cost_all(TABLE, [current, prev_week, prev_year])
     if est["ok"]:
@@ -450,29 +454,26 @@ df_prev_s = df_prev[df_prev[SHOP_COL] == selected_shop].copy()
 df_year_s = df_year[df_year[SHOP_COL] == selected_shop].copy()
 
 # ─────────────────────────────────────────
-# FILTRY (rozwijane listy, wszystkie zmienne)
+# FILTRY (w sidebarze, po załadowaniu danych)
 # ─────────────────────────────────────────
-st.markdown("### 🎛️ Filtry")
-
-ALL_FILTER_COLS = CATEGORY_COLS + [DATE_COL]
+ALL_FILTER_COLS = CATEGORY_COLS  # bez event_date (jest w zakresach dat)
 filter_cols = [c for c in ALL_FILTER_COLS if c in df_cur_s.columns]
 
 active_filters = {}
 if filter_cols:
-    n_filter_cols = min(len(filter_cols), 5)
-    fcols = st.columns(n_filter_cols)
-    for i, fc in enumerate(filter_cols):
-        with fcols[i % n_filter_cols]:
-            icon = "📅" if fc == DATE_COL else "🏷️"
-            unique_vals = sorted(df_cur_s[fc].dropna().unique().tolist())
-            selected = st.selectbox(
-                f"{icon} {fc}",
-                options=["(wszystkie)"] + unique_vals,
-                index=0,
-                key=f"filter_{fc}",
-            )
-            if selected != "(wszystkie)":
-                active_filters[fc] = selected
+    # Aktualizuj sidebar z filtrami
+    with st.sidebar:
+        with st.expander("🎛️ Filtry", expanded=False):
+            for fc in filter_cols:
+                unique_vals = sorted(df_cur_s[fc].dropna().unique().tolist())
+                selected = st.selectbox(
+                    f"{fc}",
+                    options=["(wszystkie)"] + unique_vals,
+                    index=0,
+                    key=f"filter_{fc}",
+                )
+                if selected != "(wszystkie)":
+                    active_filters[fc] = selected
 
 # ── Zastosuj filtry ──────────────────────────────────────────────────────────
 def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
@@ -492,8 +493,7 @@ if active_filters:
     )
     st.markdown(f"**Aktywne filtry:** {tags_html}", unsafe_allow_html=True)
     st.caption(f"Wiersze po filtrach: {len(df_cur_f):,} z {len(df_cur_s):,} bieżącego okresu")
-
-st.markdown("---")
+    st.markdown("---")
 
 # ── Metryki główne ───────────────────────────────────────────────────────────
 st.markdown("### 📦 Podsumowanie okresu")
@@ -564,7 +564,7 @@ group_col = st.selectbox("Kategoria do analizy", available_cats)
 
 book_tab1, book_tab2, book_tab3 = st.tabs(["📦 Produkty", "🔢 Variants", "📊 Quantity"])
 
-def styled_df(cmp, pct_col_name="zmiana % vs poprz."):
+def styled_df(cmp):
     """Color styling dla kolumn zmiana %."""
     pct_cols = [c for c in cmp.columns if "zmiana %" in c]
     def color_col(col):
@@ -599,12 +599,12 @@ with book_tab2:
         if cmp_var.empty:
             st.info("Brak danych.")
         else:
-            # Filtruj tylko kolumny variants
-            var_cols = [c for c in cmp_var.columns if "variants" in c.lower()]
+            # Wyświetl tylko kolumny variants + group cols
             group_cols = [group_col] + list(active_filters.keys())
+            var_cols = [c for c in cmp_var.columns if "variants" in c.lower()]
             display_cols = group_cols + var_cols
             display_cols = [c for c in display_cols if c in cmp_var.columns]
-            st.dataframe(styled_df(cmp_var), use_container_width=True, height=500)
+            st.dataframe(styled_df(cmp_var[display_cols]), use_container_width=True, height=500)
 
 # ── TAB 3: Quantity (suma) ───────────────────────────────────────────────────
 with book_tab3:
@@ -619,12 +619,12 @@ with book_tab3:
         if cmp_qty.empty:
             st.info("Brak danych.")
         else:
-            # Filtruj tylko kolumny quantity
-            qty_cols = [c for c in cmp_qty.columns if "quantity" in c.lower()]
+            # Wyświetl tylko kolumny quantity + group cols
             group_cols = [group_col] + list(active_filters.keys())
+            qty_cols = [c for c in cmp_qty.columns if "quantity" in c.lower()]
             display_cols = group_cols + qty_cols
             display_cols = [c for c in display_cols if c in cmp_qty.columns]
-            st.dataframe(styled_df(cmp_qty), use_container_width=True, height=500)
+            st.dataframe(styled_df(cmp_qty[display_cols]), use_container_width=True, height=500)
 
 # ── Eksport ──────────────────────────────────────────────────────────────────
 st.markdown("---")
