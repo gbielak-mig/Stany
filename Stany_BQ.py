@@ -386,8 +386,6 @@ with st.sidebar:
     st.caption("*Dostępne po załadowaniu danych*")
 
     st.markdown("---")
-
-    # ── Dry run ─────────────────────────────────────────────────────────────
     est = estimate_cost_all(TABLE, [current, prev_week, prev_year])
     if est["ok"]:
         color = "#2ecc71" if est["cost_usd"] < 0.01 else "#ffd700" if est["cost_usd"] < 0.10 else "#ff9f4d"
@@ -454,26 +452,28 @@ df_prev_s = df_prev[df_prev[SHOP_COL] == selected_shop].copy()
 df_year_s = df_year[df_year[SHOP_COL] == selected_shop].copy()
 
 # ─────────────────────────────────────────
-# FILTRY (w sidebarze, po załadowaniu danych)
+# FILTRY (na górze strony głównej)
 # ─────────────────────────────────────────
+st.markdown("### 🎛️ Filtry")
+
 ALL_FILTER_COLS = CATEGORY_COLS  # bez event_date (jest w zakresach dat)
 filter_cols = [c for c in ALL_FILTER_COLS if c in df_cur_s.columns]
 
 active_filters = {}
 if filter_cols:
-    # Aktualizuj sidebar z filtrami
-    with st.sidebar:
-        with st.expander("🎛️ Filtry", expanded=False):
-            for fc in filter_cols:
-                unique_vals = sorted(df_cur_s[fc].dropna().unique().tolist())
-                selected = st.selectbox(
-                    f"{fc}",
-                    options=["(wszystkie)"] + unique_vals,
-                    index=0,
-                    key=f"filter_{fc}",
-                )
-                if selected != "(wszystkie)":
-                    active_filters[fc] = selected
+    n_filter_cols = min(len(filter_cols), 5)
+    fcols = st.columns(n_filter_cols)
+    for i, fc in enumerate(filter_cols):
+        with fcols[i % n_filter_cols]:
+            unique_vals = sorted(df_cur_s[fc].dropna().unique().tolist())
+            selected = st.selectbox(
+                f"{fc}",
+                options=["(wszystkie)"] + unique_vals,
+                index=0,
+                key=f"filter_{fc}",
+            )
+            if selected != "(wszystkie)":
+                active_filters[fc] = selected
 
 # ── Zastosuj filtry ──────────────────────────────────────────────────────────
 def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
@@ -493,9 +493,12 @@ if active_filters:
     )
     st.markdown(f"**Aktywne filtry:** {tags_html}", unsafe_allow_html=True)
     st.caption(f"Wiersze po filtrach: {len(df_cur_f):,} z {len(df_cur_s):,} bieżącego okresu")
-    st.markdown("---")
 
-# ── Metryki główne ───────────────────────────────────────────────────────────
+st.markdown("---")
+
+# ─────────────────────────────────────────
+# PODSUMOWANIE OKRESU
+# ─────────────────────────────────────────
 st.markdown("### 📦 Podsumowanie okresu")
 
 def delta_str(cur_val, prev_val):
