@@ -1,5 +1,5 @@
 """
-BQ Viewer – raport porównawczy (sklep × kategoria)
+BQ Viewer – raport porównawczy (sklep × wszystkie zmienne)
 Trzy osobne zapytania = każde tylko tyle dni ile potrzeba.
 """
 
@@ -19,7 +19,6 @@ from google.oauth2 import service_account
 YESTERDAY  = date.today() - timedelta(1)
 
 CATEGORY_COLS = ["categoryname", "gender", "season", "seasonality", "type"]
-IMPORT_TS_COL = "load_ts_utc"
 DATE_COL      = "event_date"
 SHOP_COL      = "shop_name"
 INDEX_COL     = "index"
@@ -155,40 +154,38 @@ def get_auto_periods(preset: str, custom_start: date = None, custom_end: date = 
 # ─────────────────────────────────────────
 
 def count_products(df: pd.DataFrame) -> int:
-    """Liczba unikalnych indeksów produktów w okresie."""
     if INDEX_COL in df.columns:
         return df[INDEX_COL].nunique()
     return len(df)
 
 
 def sum_col(df: pd.DataFrame, col: str) -> int:
-    """Prosta suma kolumny (variants / quantity)."""
     if col in df.columns:
         return int(df[col].sum())
     return 0
 
 
-def build_summary(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
-    """Agregacja po kategorii – unikalne indeksy produktów."""
-    if group_col not in df.columns:
-        return pd.DataFrame(columns=[group_col, "produkty"])
+def build_summary_all(df: pd.DataFrame, group_cols: list) -> pd.DataFrame:
+    """Agregacja po wszystkich zmiennych grupowania."""
+    if not group_cols:
+        return pd.DataFrame()
     
     if INDEX_COL in df.columns:
         out = (
-            df.groupby(group_col)[INDEX_COL]
+            df.groupby(group_cols)[INDEX_COL]
             .nunique()
             .reset_index()
             .rename(columns={INDEX_COL: "produkty"})
         )
     else:
-        out = df.groupby(group_col).size().reset_index(name="produkty")
+        out = df.groupby(group_cols).size().reset_index(name="produkty")
     return out.sort_values("produkty", ascending=False)
 
 
-def build_variants_summary(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
-    """Agregacja variants i quantity po kategorii – proste sumy."""
-    if group_col not in df.columns:
-        return pd.DataFrame(columns=[group_col])
+def build_variants_summary_all(df: pd.DataFrame, group_cols: list) -> pd.DataFrame:
+    """Agregacja variants i quantity po wszystkich zmiennych."""
+    if not group_cols:
+        return pd.DataFrame()
     
     agg = {}
     if VARIANTS_COL in df.columns:
@@ -196,21 +193,20 @@ def build_variants_summary(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
     if QUANTITY_COL in df.columns:
         agg[QUANTITY_COL] = "sum"
     if not agg:
-        return pd.DataFrame(columns=[group_col])
-    out = df.groupby(group_col).agg(agg).reset_index()
+        return pd.DataFrame()
+    out = df.groupby(group_cols).agg(agg).reset_index()
     sort_col = list(agg.keys())[0]
     return out.sort_values(sort_col, ascending=False)
 
 
-def compare_periods(df_cur, df_prev, df_year, group_col) -> pd.DataFrame:
-    """Porównanie trzech okresów w jednej tabeli."""
-    cur  = build_summary(df_cur,  group_col).rename(columns={"produkty": "bieżący"})
-    prev = build_summary(df_prev, group_col).rename(columns={"produkty": "poprzedni"})
-    year = build_summary(df_year, group_col).rename(columns={"produkty": "rok wcześniej"})
+def compare_periods_all(df_cur, df_prev, df_year, group_cols) -> pd.DataFrame:
+    """Porównanie trzech okresów - wszystkie zmienne."""
+    cur  = build_summary_all(df_cur,  group_cols).rename(columns={"produkty": "bieżący"})
+    prev = build_summary_all(df_prev, group_cols).rename(columns={"produkty": "poprzedni"})
+    year = build_summary_all(df_year, group_cols).rename(columns={"produkty": "rok wcześniej"})
     
-    # Merge na group_col
-    merged = cur.merge(prev, on=group_col, how="outer").fillna(0)
-    merged = merged.merge(year, on=group_col, how="outer").fillna(0)
+    merged = cur.merge(prev, on=group_cols, how="outer").fillna(0)
+    merged = merged.merge(year, on=group_cols, how="outer").fillna(0)
     
     merged["bieżący"]       = merged["bieżący"].astype(int)
     merged["poprzedni"]     = merged["poprzedni"].astype(int)
@@ -225,19 +221,19 @@ def compare_periods(df_cur, df_prev, df_year, group_col) -> pd.DataFrame:
     return merged.sort_values("bieżący", ascending=False)
 
 
-def compare_variants_periods(df_cur, df_prev, df_year, group_col) -> pd.DataFrame:
-    """Porównanie sum variants i quantity między trzema okresami w jednej tabeli."""
-    cur  = build_variants_summary(df_cur,  group_col)
-    prev = build_variants_summary(df_prev, group_col)
-    year = build_variants_summary(df_year, group_col)
+def compare_variants_periods_all(df_cur, df_prev, df_year, group_cols) -> pd.DataFrame:
+    """Porównanie variants/quantity trzech okresów."""
+    cur  = build_variants_summary_all(df_cur,  group_cols)
+    prev = build_variants_summary_all(df_prev, group_cols)
+    year = build_variants_summary_all(df_year, group_cols)
 
     if cur.empty:
         return cur
 
-    merged = cur.merge(prev, on=group_col, how="outer", suffixes=("_cur", "_prev")).fillna(0)
-    merged = merged.merge(year, on=group_col, how="outer", suffixes=("", "_year")).fillna(0)
+    merged = cur.merge(prev, on=group_cols, how="outer", suffixes=("_cur", "_prev")).fillna(0)
+    merged = merged.merge(year, on=group_cols, how="outer", suffixes=("", "_year")).fillna(0)
 
-    result = merged[[group_col]].copy()
+    result = merged[group_cols].copy()
 
     for col in [VARIANTS_COL, QUANTITY_COL]:
         col_cur  = f"{col}_cur"
@@ -343,7 +339,6 @@ with st.sidebar:
 
     auto_current, auto_prev_week, auto_prev_year = get_auto_periods(preset, c_start, c_end)
 
-    # ── Nadpisanie poprzedniego okresu ──────────────────────────────────────
     with st.expander("🔁 Nadpisz: poprzedni okres"):
         override_prev = st.checkbox("Ustaw ręcznie", key="override_prev")
         if override_prev:
@@ -353,7 +348,6 @@ with st.sidebar:
         else:
             prev_week = auto_prev_week
 
-    # ── Nadpisanie roku wcześniej ────────────────────────────────────────────
     with st.expander("📆 Nadpisz: rok wcześniej"):
         override_year = st.checkbox("Ustaw ręcznie", key="override_year")
         if override_year:
@@ -375,6 +369,7 @@ with st.sidebar:
     )
     st.markdown("---")
 
+    # ── Dry run ─────────────────────────────────────────────────────────────
     est = estimate_cost_all(TABLE, [current, prev_week, prev_year])
     if est["ok"]:
         color = "#2ecc71" if est["cost_usd"] < 0.01 else "#ffd700" if est["cost_usd"] < 0.10 else "#ff9f4d"
@@ -445,7 +440,7 @@ df_year_s = df_year[df_year[SHOP_COL] == selected_shop].copy()
 # ─────────────────────────────────────────
 st.markdown("### 🎛️ Filtry")
 
-ALL_FILTER_COLS = CATEGORY_COLS  # bez event_date (jest w zakresach dat)
+ALL_FILTER_COLS = CATEGORY_COLS
 filter_cols = [c for c in ALL_FILTER_COLS if c in df_cur_s.columns]
 
 active_filters = {}
@@ -482,7 +477,6 @@ if active_filters:
         f'<span class="filter-tag">{col}: {val}</span>' for col, val in active_filters.items()
     )
     st.markdown(f"**Aktywne filtry:** {tags_html}", unsafe_allow_html=True)
-    st.caption(f"Wiersze po filtrach: {len(df_cur_f):,} z {len(df_cur_s):,} bieżącego okresu")
 
 st.markdown("---")
 
@@ -540,16 +534,10 @@ with r3c3:
 st.markdown("---")
 
 # ─────────────────────────────────────────
-# ANALIZA KATEGORII
+# AGREGACJA PO WSZYSTKICH ZMIENNYCH FILTRÓW
 # ─────────────────────────────────────────
-st.markdown("### 🔍 Analiza kategorii")
 
-available_cats = [c for c in CATEGORY_COLS if c in df_cur.columns]
-if not available_cats:
-    st.warning("Brak kolumn kategorii w danych.")
-    st.stop()
-
-group_col = st.selectbox("Kategoria do analizy", available_cats)
+group_cols_all = [c for c in CATEGORY_COLS if c in df_cur_f.columns]
 
 # ─────────────────────────────────────────
 # BOOK: Produkty / Variants / Quantity
@@ -572,9 +560,9 @@ def styled_df(cmp):
 
 # ── TAB 1: Produkty (unikalne indeksy) ───────────────────────────────────────
 with book_tab1:
-    cmp = compare_periods(df_cur_f, df_prev_f, df_year_f, group_col)
+    cmp = compare_periods_all(df_cur_f, df_prev_f, df_year_f, group_cols_all)
     st.markdown(
-        f"**{selected_shop}** · `{group_col}` · "
+        f"**{selected_shop}** · "
         f"{current[0]}→{current[1]} vs {prev_week[0]}→{prev_week[1]} vs {prev_year[0]}→{prev_year[1]}"
     )
     st.dataframe(styled_df(cmp), use_container_width=True, height=500)
@@ -584,17 +572,16 @@ with book_tab2:
     if VARIANTS_COL not in df_cur_s.columns:
         st.warning(f"Brak kolumny `{VARIANTS_COL}` w danych.")
     else:
-        cmp_var = compare_variants_periods(df_cur_f, df_prev_f, df_year_f, group_col)
+        cmp_var = compare_variants_periods_all(df_cur_f, df_prev_f, df_year_f, group_cols_all)
         st.markdown(
-            f"**{selected_shop}** · `{group_col}` · "
+            f"**{selected_shop}** · "
             f"{current[0]}→{current[1]} vs {prev_week[0]}→{prev_week[1]} vs {prev_year[0]}→{prev_year[1]}"
         )
         if cmp_var.empty:
             st.info("Brak danych.")
         else:
-            # Wyświetl tylko kolumny variants + group col
             var_cols = [c for c in cmp_var.columns if "variants" in c.lower()]
-            display_cols = [group_col] + var_cols
+            display_cols = group_cols_all + var_cols
             display_cols = [c for c in display_cols if c in cmp_var.columns]
             st.dataframe(styled_df(cmp_var[display_cols]), use_container_width=True, height=500)
 
@@ -603,17 +590,16 @@ with book_tab3:
     if QUANTITY_COL not in df_cur_s.columns:
         st.warning(f"Brak kolumny `{QUANTITY_COL}` w danych.")
     else:
-        cmp_qty = compare_variants_periods(df_cur_f, df_prev_f, df_year_f, group_col)
+        cmp_qty = compare_variants_periods_all(df_cur_f, df_prev_f, df_year_f, group_cols_all)
         st.markdown(
-            f"**{selected_shop}** · `{group_col}` · "
+            f"**{selected_shop}** · "
             f"{current[0]}→{current[1]} vs {prev_week[0]}→{prev_week[1]} vs {prev_year[0]}→{prev_year[1]}"
         )
         if cmp_qty.empty:
             st.info("Brak danych.")
         else:
-            # Wyświetl tylko kolumny quantity + group col
             qty_cols = [c for c in cmp_qty.columns if "quantity" in c.lower()]
-            display_cols = [group_col] + qty_cols
+            display_cols = group_cols_all + qty_cols
             display_cols = [c for c in display_cols if c in cmp_qty.columns]
             st.dataframe(styled_df(cmp_qty[display_cols]), use_container_width=True, height=500)
 
@@ -621,7 +607,7 @@ with book_tab3:
 st.markdown("---")
 csv = df_cur_f.to_csv(index=False).encode("utf-8")
 st.download_button(
-    "⬇️ Pobierz bieżący okres CSV (z filtrami)",
+    "⬇️ Pobierz bieżący okres CSV",
     data=csv,
     file_name=f"bq_{selected_shop}_{current[0]}_{current[1]}.csv",
     mime="text/csv",
