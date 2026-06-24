@@ -16,7 +16,7 @@ from google.oauth2 import service_account
 # KONFIGURACJA
 # ─────────────────────────────────────────
 
-YESTERDAY  = date.today() - timedelta(1)
+TODAY  = date.today()
 
 CATEGORY_COLS = ["categoryname", "gender", "season", "seasonality", "type"]
 DATE_COL      = "event_date"
@@ -128,17 +128,17 @@ def fetch_period(_creds_hash: str, table: str, start: date, end: date) -> pd.Dat
 
 def get_auto_periods(preset: str, custom_start: date = None, custom_end: date = None):
     if preset == "Ostatni tydzień":
-        end   = YESTERDAY
+        end   = TODAY
         start = end - timedelta(6)
     elif preset == "Ostatnie 14 dni":
-        end   = YESTERDAY
+        end   = TODAY
         start = end - timedelta(13)
     elif preset == "Ostatnie 30 dni":
-        end   = YESTERDAY
+        end   = TODAY
         start = end - timedelta(29)
     else:
-        start = custom_start or (YESTERDAY - timedelta(6))
-        end   = custom_end   or YESTERDAY
+        start = custom_start or (TODAY - timedelta(6))
+        end   = custom_end   or TODAY
 
     n = (end - start).days + 1
     prev_week = (start - timedelta(n), end - timedelta(n))
@@ -332,8 +332,8 @@ with st.sidebar:
             index=0,
         )
         if preset == "Własny":
-            c_start = st.date_input("Od", YESTERDAY - timedelta(6), max_value=YESTERDAY)
-            c_end   = st.date_input("Do", YESTERDAY, max_value=YESTERDAY)
+            c_start = st.date_input("Od", TODAY - timedelta(6), max_value=TODAY)
+            c_end   = st.date_input("Do", TODAY, max_value=TODAY)
         else:
             c_start = c_end = None
 
