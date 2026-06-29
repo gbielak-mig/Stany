@@ -19,7 +19,7 @@ from google.oauth2 import service_account
 
 TODAY  = date.today()
 
-CATEGORY_COLS = ["categoryname", "gender", "season", "seasonality", "type"]
+CATEGORY_COLS = ["brand", "gender", "season", "seasonality", "type"]
 DATE_COL      = "event_date"
 SHOP_COL      = "shop_name"
 INDEX_COL     = "index"
