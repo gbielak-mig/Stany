@@ -1,6 +1,6 @@
 """
 BQ Viewer – raport porównawczy (sklep × wszystkie zmienne)
-Zoptymalizowane pobieranie równoległe + bezpiecznik + zwijane podsumowanie + mapowanie MPK.
+Zoptymalizowane pobieranie równoległe + bezpiecznik + zwijane podsumowanie + samo MPK w UI.
 """
 
 import os, json, pathlib
@@ -337,7 +337,7 @@ with st.sidebar:
     st.caption(f"📋 `{TABLE}`")
     st.markdown("---")
 
-    # ── Sklep (Z MAPOWANIEM NA MPK) ──────────────────────────────────────────
+    # ── Sklep (WYŚWIETLANIE SAMEGO KODU MPK) ──────────────────────────────────
     creds_hash = str(id(get_credentials()))
     try:
         shops_list = fetch_shops(creds_hash, TABLE)
@@ -346,14 +346,14 @@ with st.sidebar:
         st.warning(f"Nie można pobrać listy sklepów: {e}")
 
     if shops_list:
-        # Funkcja formatująca wyświetlanie elementów listy na podstawie słownika SHOP_DATA
+        # Zostawiamy wyłącznie kod MPK w widoku selektora
         def shop_formatter(raw_name):
             if raw_name in SHOP_DATA:
-                friendly_name, mpk_code = SHOP_DATA[raw_name]
-                return f"{mpk_code} — {friendly_name}"
+                _, mpk_code = SHOP_DATA[raw_name]
+                return mpk_code
             return raw_name
 
-        selected_shop = st.selectbox("🏪 Wybierz Sklep (MPK)", shops_list, format_func=shop_formatter)
+        selected_shop = st.selectbox("🏪 Wybierz MPK", shops_list, format_func=shop_formatter)
     else:
         selected_shop = None
         st.info("Brak danych o sklepach.")
@@ -428,11 +428,11 @@ with st.sidebar:
 # MAIN
 # ─────────────────────────────────────────
 
-# Wyznaczenie czytelnej nazwy sklepu (MPK — Nazwa) do nagłówków
-shop_display = f"{SHOP_DATA[selected_shop][1]} — {SHOP_DATA[selected_shop][0]}" if selected_shop in SHOP_DATA else selected_shop
+# Wyznaczenie samego kodu MPK jako nagłówka wyświetlania
+shop_display = SHOP_DATA[selected_shop][1] if selected_shop in SHOP_DATA else selected_shop
 
 st.markdown("# 📊 BQ Raport")
-st.markdown(f"`{TABLE}` &nbsp;·&nbsp; sklep: `{shop_display}` &nbsp;·&nbsp; bieżący okres: `{current[0]}` → `{current[1]}`")
+st.markdown(f"`{TABLE}` &nbsp;·&nbsp; MPK: `{shop_display}` &nbsp;·&nbsp; bieżący okres: `{current[0]}` → `{current[1]}`")
 st.markdown("---")
 
 if "df_cur" not in st.session_state:
@@ -443,12 +443,12 @@ if "df_cur" not in st.session_state:
 # POBIERANIE RÓWNOLEGŁE Z FILTREM SQL
 if fetch_btn:
     if not selected_shop:
-        st.error("Wybierz najpierw sklep!")
+        st.error("Wybierz najpierw MPK!")
         st.stop()
 
     creds_hash_fetch = str(id(get_credentials()))
     try:
-        with st.spinner(f"Pobieranie danych z BigQuery dla {shop_display}…"):
+        with st.spinner(f"Pobieranie danych z BigQuery dla MPK {shop_display}…"):
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 future_cur = executor.submit(fetch_period, creds_hash_fetch, TABLE, current[0], current[1], selected_shop)
                 future_prev = executor.submit(fetch_period, creds_hash_fetch, TABLE, prev_week[0], prev_week[1], selected_shop)
@@ -474,7 +474,7 @@ if df_cur is None:
     st.stop()
 
 if selected_shop is None:
-    st.warning("Wybierz sklep w panelu bocznym.")
+    st.warning("Wybierz MPK w panelu bocznym.")
     st.stop()
 
 # ── Filtrowanie po sklepie (bezpiecznik dla pamięci podręcznej) ───────────────
@@ -580,7 +580,6 @@ q_cur  = sum_col(df_cur_f,  QUANTITY_COL)
 q_prev = sum_col(df_prev_f, QUANTITY_COL)
 q_year = sum_col(df_year_f, QUANTITY_COL)
 
-# Sekcja ujęta w expander domyślnie zamknięty (expanded=False)
 with st.expander("📦 Podsumowanie okresu (kliknij, aby rozwinąć)", expanded=False):
     st.markdown('<div class="period-label">Bieżący okres vs poprzedni</div>', unsafe_allow_html=True)
     r1c1, r1c2, r1c3 = st.columns(3)
@@ -688,10 +687,9 @@ with book_tab3:
 # ── Eksport ──────────────────────────────────────────────────────────────────
 st.markdown("---")
 csv = df_cur_f.to_csv(index=False).encode("utf-8")
-shop_file_suffix = SHOP_DATA[selected_shop][1] if selected_shop in SHOP_DATA else selected_shop
 st.download_button(
     "⬇️ Pobierz bieżący okres CSV",
     data=csv,
-    file_name=f"bq_{shop_file_suffix}_{current[0]}_{current[1]}.csv",
+    file_name=f"bq_{shop_display}_{current[0]}_{current[1]}.csv",
     mime="text/csv",
 )
