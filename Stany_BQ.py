@@ -1,7 +1,6 @@
 """
 BQ Viewer – raport porównawczy (sklep × wszystkie zmienne)
-Trzy osobne zapytania = każde tylko tyle dni ile potrzeba.
-Zoptymalizowane pobieranie równoległe + Gross Changes.
+Zoptymalizowane pobieranie równoległe (SQL) + bezpiecznik Pandas + Gross Changes.
 """
 
 import os, json, pathlib
@@ -444,10 +443,10 @@ if selected_shop is None:
     st.warning("Wybierz sklep w panelu bocznym.")
     st.stop()
 
-# Dane są już przefiltrowane po sklepie na poziomie BigQuery
-df_cur_s  = df_cur.copy()
-df_prev_s = df_prev.copy()
-df_year_s = df_year.copy()
+# ── Filtrowanie po sklepie (bezpiecznik dla pamięci podręcznej) ───────────────
+df_cur_s  = df_cur[df_cur[SHOP_COL]   == selected_shop].copy()
+df_prev_s = df_prev[df_prev[SHOP_COL] == selected_shop].copy()
+df_year_s = df_year[df_year[SHOP_COL] == selected_shop].copy()
 
 
 # ─────────────────────────────────────────
