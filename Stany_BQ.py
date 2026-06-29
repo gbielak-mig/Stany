@@ -1,10 +1,12 @@
 """
 BQ Viewer – raport porównawczy (sklep × wszystkie zmienne)
-Trzy osobne zapytania = każde tylko tyle dni ile potrzeba.
+Trzy zapytania uruchamiane RÓWNOLEGLE, każde filtrowane po sklepie w SQL
+(zamiast ściągać wszystkie sklepy i filtrować w Pandasie).
 """
 
 import os, json, pathlib
 from datetime import date, timedelta
+from concurrent.futures import ThreadPoolExecutor
 
 import streamlit as st
 import pandas as pd
@@ -55,15 +57,41 @@ def parse_project(table: str) -> str:
 
 
 # ─────────────────────────────────────────
+# QUERY (sklep filtrowany w SQL przez parametry)
+# ─────────────────────────────────────────
+
+def build_query(table: str) -> str:
+    extra_cols = ", ".join([INDEX_COL] + CATEGORY_COLS + [VARIANTS_COL, QUANTITY_COL])
+    return f"""
+    SELECT {SHOP_COL}, {DATE_COL}, {extra_cols}
+    FROM `{table}`
+    WHERE {DATE_COL} BETWEEN @start AND @end
+      AND {SHOP_COL} = @shop
+    """
+
+
+def _job_config(start: date, end: date, shop: str) -> bigquery.QueryJobConfig:
+    return bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("start", "DATE", start),
+            bigquery.ScalarQueryParameter("end", "DATE", end),
+            bigquery.ScalarQueryParameter("shop", "STRING", shop),
+        ]
+    )
+
+
+# ─────────────────────────────────────────
 # COST ESTIMATE (DRY RUN)
 # ─────────────────────────────────────────
 
-def estimate_cost_single(table: str, start: date, end: date) -> dict:
+def estimate_cost_single(table: str, start: date, end: date, shop: str) -> dict:
     try:
         project = parse_project(table)
         client  = get_client(project)
-        query   = build_query(table, start, end)
-        cfg     = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
+        query   = build_query(table)
+        cfg     = _job_config(start, end, shop)
+        cfg.dry_run = True
+        cfg.use_query_cache = False
         job     = client.query(query, job_config=cfg)
         gb      = job.total_bytes_processed / 1e9
         cost    = gb / 1000 * 5
@@ -72,11 +100,13 @@ def estimate_cost_single(table: str, start: date, end: date) -> dict:
         return {"gb": 0, "cost_usd": 0, "ok": False, "error": str(e)}
 
 
-def estimate_cost_all(table: str, periods: list) -> dict:
+def estimate_cost_all(table: str, periods: list, shop: str) -> dict:
+    if not shop:
+        return {"gb": 0, "cost_usd": 0, "ok": False, "error": "Brak wybranego sklepu"}
     total_gb   = 0
     total_cost = 0
     for start, end in periods:
-        est = estimate_cost_single(table, start, end)
+        est = estimate_cost_single(table, start, end, shop)
         if not est["ok"]:
             return est
         total_gb   += est["gb"]
@@ -99,27 +129,29 @@ def fetch_shops(_creds_hash: str, table: str) -> list:
 
 
 # ─────────────────────────────────────────
-# QUERY
+# FETCH OKRESU (filtrowany po sklepie w SQL)
 # ─────────────────────────────────────────
 
-def build_query(table: str, start: date, end: date) -> str:
-    extra_cols = ", ".join([INDEX_COL] + CATEGORY_COLS + [VARIANTS_COL, QUANTITY_COL])
-    return f"""
-    SELECT {SHOP_COL}, {DATE_COL}, {extra_cols}
-    FROM `{table}`
-    WHERE {DATE_COL} BETWEEN '{start.isoformat()}' AND '{end.isoformat()}'
-    """
-
-
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_period(_creds_hash: str, table: str, start: date, end: date) -> pd.DataFrame:
+def fetch_period(_creds_hash: str, table: str, start: date, end: date, shop: str) -> pd.DataFrame:
     project = parse_project(table)
     client  = bigquery.Client(credentials=get_credentials(), project=project)
-    job     = client.query(build_query(table, start, end))
+    job     = client.query(build_query(table), job_config=_job_config(start, end, shop))
     df      = job.result().to_dataframe()
     if DATE_COL in df.columns:
         df[DATE_COL] = pd.to_datetime(df[DATE_COL]).dt.date
     return df
+
+
+def fetch_all_periods(creds_hash: str, table: str, current, prev_week, prev_year, shop: str) -> dict:
+    """Pobiera 3 okresy RÓWNOLEGLE (każdy w osobnym wątku/job BQ)."""
+    periods = {"cur": current, "prev": prev_week, "year": prev_year}
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futures = {
+            key: ex.submit(fetch_period, creds_hash, table, start, end, shop)
+            for key, (start, end) in periods.items()
+        }
+        return {key: f.result() for key, f in futures.items()}
 
 
 # ─────────────────────────────────────────
@@ -165,11 +197,23 @@ def sum_col(df: pd.DataFrame, col: str) -> int:
     return 0
 
 
+def delta_breakdown(df_cur: pd.DataFrame, df_other: pd.DataFrame, index_col: str = INDEX_COL):
+    """Ile produktów (unikalnych index) zostało dodanych, a ile odjętych
+    między df_other (poprzedni/rok wcześniej) a df_cur (bieżący)."""
+    if index_col not in df_cur.columns or index_col not in df_other.columns:
+        return None, None
+    cur_set   = set(df_cur[index_col].dropna().unique())
+    other_set = set(df_other[index_col].dropna().unique())
+    added   = len(cur_set - other_set)   # są teraz, nie było ich wcześniej
+    removed = len(other_set - cur_set)   # były wcześniej, nie ma teraz
+    return added, removed
+
+
 def build_summary_all(df: pd.DataFrame, group_cols: list) -> pd.DataFrame:
     """Agregacja po wszystkich zmiennych grupowania."""
     if not group_cols:
         return pd.DataFrame()
-    
+
     if INDEX_COL in df.columns:
         out = (
             df.groupby(group_cols)[INDEX_COL]
@@ -186,7 +230,7 @@ def build_variants_summary_all(df: pd.DataFrame, group_cols: list) -> pd.DataFra
     """Agregacja variants i quantity po wszystkich zmiennych."""
     if not group_cols:
         return pd.DataFrame()
-    
+
     agg = {}
     if VARIANTS_COL in df.columns:
         agg[VARIANTS_COL] = "sum"
@@ -204,10 +248,10 @@ def compare_periods_all(df_cur, df_prev, df_year, group_cols) -> pd.DataFrame:
     cur  = build_summary_all(df_cur,  group_cols).rename(columns={"produkty": "bieżący"})
     prev = build_summary_all(df_prev, group_cols).rename(columns={"produkty": "poprzedni"})
     year = build_summary_all(df_year, group_cols).rename(columns={"produkty": "rok wcześniej"})
-    
+
     merged = cur.merge(prev, on=group_cols, how="outer").fillna(0)
     merged = merged.merge(year, on=group_cols, how="outer").fillna(0)
-    
+
     merged["bieżący"]       = merged["bieżący"].astype(int)
     merged["poprzedni"]     = merged["poprzedni"].astype(int)
     merged["rok wcześniej"] = merged["rok wcześniej"].astype(int)
@@ -217,7 +261,7 @@ def compare_periods_all(df_cur, df_prev, df_year, group_cols) -> pd.DataFrame:
         if r["poprzedni"] > 0 else ("nowe" if r["bieżący"] > 0 else "–"),
         axis=1,
     )
-    
+
     return merged.sort_values("bieżący", ascending=False)
 
 
@@ -239,12 +283,12 @@ def compare_variants_periods_all(df_cur, df_prev, df_year, group_cols) -> pd.Dat
         col_cur  = f"{col}_cur"
         col_prev = f"{col}_prev"
         col_year = f"{col}_year"
-        
+
         if col_cur in merged.columns:
             merged[col_cur]  = merged[col_cur].astype(int)
             merged[col_prev] = merged[col_prev].astype(int)
             merged[col_year] = merged[col_year].astype(int) if col_year in merged.columns else 0
-            
+
             result[f"{col} (bież.)"]  = merged[col_cur]
             result[f"{col} (poprz.)"] = merged[col_prev]
             result[f"{col} (rok temu)"] = merged[col_year]
@@ -283,6 +327,9 @@ div[data-testid="stSidebar"] { background: #111; border-right: 1px solid #222; }
     border-radius: 4px; padding: 2px 8px; font-size: 0.72rem; color: #2ecc71;
     margin: 2px 3px 2px 0;
 }
+.breakdown-line { font-size: 0.78rem; margin-top: 2px; }
+.breakdown-added { color: #2ecc71; }
+.breakdown-removed { color: #e74c3c; margin-left: 10px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -369,16 +416,16 @@ with st.sidebar:
     )
     st.markdown("---")
 
-    # ── Dry run ─────────────────────────────────────────────────────────────
-    est = estimate_cost_all(TABLE, [current, prev_week, prev_year])
+    # ── Dry run (filtrowany po sklepie -> realny koszt) ─────────────────────
+    est = estimate_cost_all(TABLE, [current, prev_week, prev_year], selected_shop)
     if est["ok"]:
         color = "#2ecc71" if est["cost_usd"] < 0.01 else "#ffd700" if est["cost_usd"] < 0.10 else "#ff9f4d"
         st.markdown(f"""
         <div class="cost-box">
-            <div class="label">Szacowany koszt (3 zapytania)</div>
+            <div class="label">Szacowany koszt (3 zapytania · {selected_shop})</div>
             <strong style="color:{color}">${est['cost_usd']:.6f}</strong>
             &nbsp;·&nbsp; <strong>{est['gb']:.4f} GB</strong>
-            <div style="font-size:0.68rem;color:#555;margin-top:4px">dry run · $5/TB · 3 osobne query</div>
+            <div style="font-size:0.68rem;color:#555;margin-top:4px">dry run · $5/TB · filtrowane po sklepie</div>
         </div>
         """, unsafe_allow_html=True)
     else:
@@ -402,16 +449,22 @@ if "df_cur" not in st.session_state:
     st.session_state.df_year = None
 
 if fetch_btn:
+    if not selected_shop:
+        st.sidebar.warning("Wybierz sklep przed pobraniem danych.")
+        st.stop()
+
     creds_hash_fetch = str(id(get_credentials()))
     try:
-        with st.spinner("Pobieranie bieżącego okresu…"):
-            st.session_state.df_cur = fetch_period(creds_hash_fetch, TABLE, *current)
-        with st.spinner("Pobieranie poprzedniego okresu…"):
-            st.session_state.df_prev = fetch_period(creds_hash_fetch, TABLE, *prev_week)
-        with st.spinner("Pobieranie roku wcześniej…"):
-            st.session_state.df_year = fetch_period(creds_hash_fetch, TABLE, *prev_year)
+        with st.spinner("Pobieranie 3 okresów równolegle…"):
+            results = fetch_all_periods(
+                creds_hash_fetch, TABLE, current, prev_week, prev_year, selected_shop
+            )
 
-        total = len(st.session_state.df_cur) + len(st.session_state.df_prev) + len(st.session_state.df_year)
+        st.session_state.df_cur  = results["cur"]
+        st.session_state.df_prev = results["prev"]
+        st.session_state.df_year = results["year"]
+
+        total = sum(len(d) for d in results.values())
         st.sidebar.success(f"✅ {total:,} wierszy łącznie")
         st.rerun()
     except Exception as e:
@@ -430,10 +483,10 @@ if selected_shop is None:
     st.warning("Wybierz sklep w panelu bocznym.")
     st.stop()
 
-# ── Filtrowanie po sklepie ───────────────────────────────────────────────────
-df_cur_s  = df_cur[df_cur[SHOP_COL]   == selected_shop].copy()
-df_prev_s = df_prev[df_prev[SHOP_COL] == selected_shop].copy()
-df_year_s = df_year[df_year[SHOP_COL] == selected_shop].copy()
+# Dane są już przefiltrowane po sklepie na poziomie SQL — kopiujemy 1:1.
+df_cur_s  = df_cur.copy()
+df_prev_s = df_prev.copy()
+df_year_s = df_year.copy()
 
 # ─────────────────────────────────────────
 # FILTRY (na górze strony głównej)
@@ -492,6 +545,18 @@ def delta_str(cur_val, prev_val):
     pct = d / prev_val * 100
     return f"{d:+,} ({pct:+.1f}%)"
 
+def render_breakdown(added, removed):
+    """Render zielono/czerwono: ile dodanych, ile odjętych produktów."""
+    if added is None:
+        return
+    st.markdown(
+        f'<div class="breakdown-line">'
+        f'<span class="breakdown-added">▲ {added:,} dodanych</span>'
+        f'<span class="breakdown-removed">▼ {removed:,} usuniętych</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
 n_cur  = count_products(df_cur_f)
 n_prev = count_products(df_prev_f)
 n_year = count_products(df_year_f)
@@ -504,10 +569,15 @@ q_cur  = sum_col(df_cur_f,  QUANTITY_COL)
 q_prev = sum_col(df_prev_f, QUANTITY_COL)
 q_year = sum_col(df_year_f, QUANTITY_COL)
 
+# breakdown produktów (dodane/odjęte) liczony na zbiorach unikalnych index
+added_w, removed_w = delta_breakdown(df_cur_f, df_prev_f)
+added_y, removed_y = delta_breakdown(df_cur_f, df_year_f)
+
 st.markdown('<div class="period-label">Bieżący okres</div>', unsafe_allow_html=True)
 r1c1, r1c2, r1c3 = st.columns(3)
 with r1c1:
     st.metric(f"📦 Produkty · {current[0]} → {current[1]}", f"{n_cur:,}", delta=delta_str(n_cur, n_prev))
+    render_breakdown(added_w, removed_w)
 with r1c2:
     st.metric("🔢 Variants", f"{v_cur:,}", delta=delta_str(v_cur, v_prev))
 with r1c3:
@@ -526,6 +596,7 @@ st.markdown('<div class="period-label" style="margin-top:14px">Rok wcześniej</d
 r3c1, r3c2, r3c3 = st.columns(3)
 with r3c1:
     st.metric(f"📦 Produkty · {prev_year[0]} → {prev_year[1]}", f"{n_year:,}", delta=delta_str(n_cur, n_year))
+    render_breakdown(added_y, removed_y)
 with r3c2:
     st.metric("🔢 Variants", f"{v_year:,}", delta=delta_str(v_cur, v_year))
 with r3c3:
