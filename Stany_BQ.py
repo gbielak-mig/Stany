@@ -1,10 +1,12 @@
 """
 BQ Viewer – raport porównawczy (sklep × wszystkie zmienne)
 Trzy osobne zapytania = każde tylko tyle dni ile potrzeba.
+Zoptymalizowane pobieranie równoległe + Gross Changes.
 """
 
 import os, json, pathlib
 from datetime import date, timedelta
+import concurrent.futures
 
 import streamlit as st
 import pandas as pd
@@ -102,20 +104,23 @@ def fetch_shops(_creds_hash: str, table: str) -> list:
 # QUERY
 # ─────────────────────────────────────────
 
-def build_query(table: str, start: date, end: date) -> str:
+def build_query(table: str, start: date, end: date, shop_name: str = None) -> str:
     extra_cols = ", ".join([INDEX_COL] + CATEGORY_COLS + [VARIANTS_COL, QUANTITY_COL])
+    shop_filter = f"AND {SHOP_COL} = '{shop_name}'" if shop_name else ""
+    
     return f"""
     SELECT {SHOP_COL}, {DATE_COL}, {extra_cols}
     FROM `{table}`
     WHERE {DATE_COL} BETWEEN '{start.isoformat()}' AND '{end.isoformat()}'
+    {shop_filter}
     """
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_period(_creds_hash: str, table: str, start: date, end: date) -> pd.DataFrame:
+def fetch_period(_creds_hash: str, table: str, start: date, end: date, shop_name: str) -> pd.DataFrame:
     project = parse_project(table)
     client  = bigquery.Client(credentials=get_credentials(), project=project)
-    job     = client.query(build_query(table, start, end))
+    job     = client.query(build_query(table, start, end, shop_name))
     df      = job.result().to_dataframe()
     if DATE_COL in df.columns:
         df[DATE_COL] = pd.to_datetime(df[DATE_COL]).dt.date
@@ -283,6 +288,7 @@ div[data-testid="stSidebar"] { background: #111; border-right: 1px solid #222; }
     border-radius: 4px; padding: 2px 8px; font-size: 0.72rem; color: #2ecc71;
     margin: 2px 3px 2px 0;
 }
+.gross-box { font-size: 0.85rem; margin-top: -8px; margin-bottom: 12px; font-weight: 600; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -301,7 +307,7 @@ with st.sidebar:
         st.error(
             "Brak tabeli w secrets.toml. Dodaj linię:\n\n"
             "`STANY = \"projekt.dataset.tabela\"`\n\n"
-            f"Dostępne klucze w secrets: `{available}`"
+            "Dostępne klucze w secrets: `{available}`"
         )
         st.stop()
 
@@ -378,7 +384,7 @@ with st.sidebar:
             <div class="label">Szacowany koszt (3 zapytania)</div>
             <strong style="color:{color}">${est['cost_usd']:.6f}</strong>
             &nbsp;·&nbsp; <strong>{est['gb']:.4f} GB</strong>
-            <div style="font-size:0.68rem;color:#555;margin-top:4px">dry run · $5/TB · 3 osobne query</div>
+            <div style="font-size:0.68rem;color:#555;margin-top:4px">dry run · $5/TB · zoptymalizowane pod sklep</div>
         </div>
         """, unsafe_allow_html=True)
     else:
@@ -401,18 +407,26 @@ if "df_cur" not in st.session_state:
     st.session_state.df_prev = None
     st.session_state.df_year = None
 
+# POBIERANIE RÓWNOLEGŁE Z FILTREM SQL
 if fetch_btn:
+    if not selected_shop:
+        st.error("Wybierz najpierw sklep!")
+        st.stop()
+
     creds_hash_fetch = str(id(get_credentials()))
     try:
-        with st.spinner("Pobieranie bieżącego okresu…"):
-            st.session_state.df_cur = fetch_period(creds_hash_fetch, TABLE, *current)
-        with st.spinner("Pobieranie poprzedniego okresu…"):
-            st.session_state.df_prev = fetch_period(creds_hash_fetch, TABLE, *prev_week)
-        with st.spinner("Pobieranie roku wcześniej…"):
-            st.session_state.df_year = fetch_period(creds_hash_fetch, TABLE, *prev_year)
+        with st.spinner("Pobieranie 3 okresów równolegle z BigQuery per sklep…"):
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future_cur = executor.submit(fetch_period, creds_hash_fetch, TABLE, current[0], current[1], selected_shop)
+                future_prev = executor.submit(fetch_period, creds_hash_fetch, TABLE, prev_week[0], prev_week[1], selected_shop)
+                future_year = executor.submit(fetch_period, creds_hash_fetch, TABLE, prev_year[0], prev_year[1], selected_shop)
+                
+                st.session_state.df_cur = future_cur.result()
+                st.session_state.df_prev = future_prev.result()
+                st.session_state.df_year = future_year.result()
 
         total = len(st.session_state.df_cur) + len(st.session_state.df_prev) + len(st.session_state.df_year)
-        st.sidebar.success(f"✅ {total:,} wierszy łącznie")
+        st.sidebar.success(f"✅ {total:,} wierszy dla {selected_shop}")
         st.rerun()
     except Exception as e:
         st.error(f"❌ Błąd: {e}")
@@ -430,10 +444,11 @@ if selected_shop is None:
     st.warning("Wybierz sklep w panelu bocznym.")
     st.stop()
 
-# ── Filtrowanie po sklepie ───────────────────────────────────────────────────
-df_cur_s  = df_cur[df_cur[SHOP_COL]   == selected_shop].copy()
-df_prev_s = df_prev[df_prev[SHOP_COL] == selected_shop].copy()
-df_year_s = df_year[df_year[SHOP_COL] == selected_shop].copy()
+# Dane są już przefiltrowane po sklepie na poziomie BigQuery
+df_cur_s  = df_cur.copy()
+df_prev_s = df_prev.copy()
+df_year_s = df_year.copy()
+
 
 # ─────────────────────────────────────────
 # FILTRY (na górze strony głównej)
@@ -459,9 +474,9 @@ if filter_cols:
             if selected:
                 active_filters[fc] = selected
 
+
 # ── Zastosuj filtry ──────────────────────────────────────────────────────────
 def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
-    """Filtry multiselect – dla każdej kolumny OR między wartościami, AND między kolumnami."""
     for col, vals in filters.items():
         if col in df.columns and vals:
             df = df[df[col].isin(vals)]
@@ -471,7 +486,6 @@ df_cur_f  = apply_filters(df_cur_s.copy(),  active_filters)
 df_prev_f = apply_filters(df_prev_s.copy(), active_filters)
 df_year_f = apply_filters(df_year_s.copy(), active_filters)
 
-# ── Pokaż aktywne filtry ─────────────────────────────────────────────────────
 if active_filters:
     tags_html = "".join(
         f'<span class="filter-tag">{col}: {val}</span>' for col, val in active_filters.items()
@@ -479,6 +493,36 @@ if active_filters:
     st.markdown(f"**Aktywne filtry:** {tags_html}", unsafe_allow_html=True)
 
 st.markdown("---")
+
+
+# ─────────────────────────────────────────
+# OBLICZENIA: DODANE / ODJĘTE (Gross Changes)
+# ─────────────────────────────────────────
+
+# 1. Zmiany dla unikalnych Produktów (ID)
+set_cur = set(df_cur_f[INDEX_COL].dropna().unique()) if INDEX_COL in df_cur_f.columns else set()
+set_prev = set(df_prev_f[INDEX_COL].dropna().unique()) if INDEX_COL in df_prev_f.columns else set()
+
+p_added = len(set_cur - set_prev)
+p_removed = len(set_prev - set_cur)
+
+# 2. Helper dla wolumenów (Variants i Quantity) rozbitych na plusy i minusy per produkt
+def get_gross_changes(df_c, df_p, col):
+    if col not in df_c.columns or INDEX_COL not in df_c.columns:
+        return 0, 0
+    c_sum = df_c.groupby(INDEX_COL)[col].sum()
+    p_sum = df_p.groupby(INDEX_COL)[col].sum()
+    
+    merged = pd.concat([c_sum, p_sum], axis=1, keys=['cur', 'prev']).fillna(0)
+    diff = merged['cur'] - merged['prev']
+    
+    added = int(diff[diff > 0].sum())
+    removed = int(abs(diff[diff < 0].sum()))
+    return added, removed
+
+v_added, v_removed = get_gross_changes(df_cur_f, df_prev_f, VARIANTS_COL)
+q_added, q_removed = get_gross_changes(df_cur_f, df_prev_f, QUANTITY_COL)
+
 
 # ─────────────────────────────────────────
 # PODSUMOWANIE OKRESU
@@ -504,14 +548,17 @@ q_cur  = sum_col(df_cur_f,  QUANTITY_COL)
 q_prev = sum_col(df_prev_f, QUANTITY_COL)
 q_year = sum_col(df_year_f, QUANTITY_COL)
 
-st.markdown('<div class="period-label">Bieżący okres</div>', unsafe_allow_html=True)
+st.markdown('<div class="period-label">Bieżący okres vs poprzedni</div>', unsafe_allow_html=True)
 r1c1, r1c2, r1c3 = st.columns(3)
 with r1c1:
     st.metric(f"📦 Produkty · {current[0]} → {current[1]}", f"{n_cur:,}", delta=delta_str(n_cur, n_prev))
+    st.markdown(f'<div class="gross-box"><span style="color:#2ecc71">▲ +{p_added:,}</span> &nbsp;&nbsp;&nbsp; <span style="color:#e74c3c">▼ -{p_removed:,}</span></div>', unsafe_allow_html=True)
 with r1c2:
     st.metric("🔢 Variants", f"{v_cur:,}", delta=delta_str(v_cur, v_prev))
+    st.markdown(f'<div class="gross-box"><span style="color:#2ecc71">▲ +{v_added:,}</span> &nbsp;&nbsp;&nbsp; <span style="color:#e74c3c">▼ -{v_removed:,}</span></div>', unsafe_allow_html=True)
 with r1c3:
     st.metric("📊 Quantity", f"{q_cur:,}", delta=delta_str(q_cur, q_prev))
+    st.markdown(f'<div class="gross-box"><span style="color:#2ecc71">▲ +{q_added:,}</span> &nbsp;&nbsp;&nbsp; <span style="color:#e74c3c">▼ -{q_removed:,}</span></div>', unsafe_allow_html=True)
 
 st.markdown('<div class="period-label" style="margin-top:14px">Poprzedni okres</div>', unsafe_allow_html=True)
 r2c1, r2c2, r2c3 = st.columns(3)
@@ -533,14 +580,16 @@ with r3c3:
 
 st.markdown("---")
 
+
 # ─────────────────────────────────────────
 # AGREGACJA PO WSZYSTKICH ZMIENNYCH FILTRÓW
 # ─────────────────────────────────────────
 
 group_cols_all = [c for c in CATEGORY_COLS if c in df_cur_f.columns]
 
+
 # ─────────────────────────────────────────
-# BOOK: Produkty / Variants / Quantity
+# TABS: Produkty / Variants / Quantity
 # ─────────────────────────────────────────
 
 book_tab1, book_tab2, book_tab3 = st.tabs(["📦 Produkty", "🔢 Variants", "📊 Quantity"])
@@ -558,7 +607,7 @@ def styled_df(cmp):
         return [""] * len(col)
     return cmp.style.apply(color_col, axis=0)
 
-# ── TAB 1: Produkty (unikalne indeksy) ───────────────────────────────────────
+# ── TAB 1: Produkty ──────────────────────────────────────────────────────────
 with book_tab1:
     cmp = compare_periods_all(df_cur_f, df_prev_f, df_year_f, group_cols_all)
     st.markdown(
@@ -567,7 +616,7 @@ with book_tab1:
     )
     st.dataframe(styled_df(cmp), use_container_width=True, height=500)
 
-# ── TAB 2: Variants (suma) ───────────────────────────────────────────────────
+# ── TAB 2: Variants ──────────────────────────────────────────────────────────
 with book_tab2:
     if VARIANTS_COL not in df_cur_s.columns:
         st.warning(f"Brak kolumny `{VARIANTS_COL}` w danych.")
@@ -585,7 +634,7 @@ with book_tab2:
             display_cols = [c for c in display_cols if c in cmp_var.columns]
             st.dataframe(styled_df(cmp_var[display_cols]), use_container_width=True, height=500)
 
-# ── TAB 3: Quantity (suma) ───────────────────────────────────────────────────
+# ── TAB 3: Quantity ──────────────────────────────────────────────────────────
 with book_tab3:
     if QUANTITY_COL not in df_cur_s.columns:
         st.warning(f"Brak kolumny `{QUANTITY_COL}` w danych.")
