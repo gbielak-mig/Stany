@@ -1,6 +1,7 @@
 """
 BQ Viewer – raport porównawczy (sklep × wszystkie zmienne)
 Zoptymalizowane pobieranie + samo MPK + stałe podsumowanie okresu + ukryte koszty.
+Wymiar 'categoryname' zastąpiony przez 'brand'.
 """
 
 import os, json, pathlib
@@ -19,6 +20,7 @@ from google.oauth2 import service_account
 
 TODAY  = date.today()
 
+# Zamieniono 'categoryname' na 'brand'
 CATEGORY_COLS = ["brand", "gender", "season", "seasonality", "type"]
 DATE_COL      = "event_date"
 SHOP_COL      = "shop_name"
@@ -35,14 +37,14 @@ RAW_SHOP_DATA = {
     "Sizeer HU": ("Sizeer HU", "HU50"),
     "Sizeer SI": ("Sizeer SI", "SI50"),
     "Timberland": ("Timberland", "S502"),
-    "Sizeer RO [new]": ("Sizeer RO", "RO50"),
+    "Sizeer RO": ("Sizeer RO [new]", "RO50"),
     "Buty Sportowe PL": ("Buty Sportowe", "S514"),
     "Sizeer DE": ("Sizeer DE", "G500"),
     "Sizeer CZ": ("Sizeer CZ", "CZ50"),
     "Symbiosis": ("Symbiosis PL", "S507"),
     "Sizeer LV": ("Sizeer LV", "LV50"),
     "Sizeer SK": ("Sizeer SK", "SK50"),
-    "Sizeer PL [new]": ("Sizeer PL", "S500"),
+    "Sizeer PL": ("Sizeer PL [new]", "S500"),
     "Jdsports BG": ("JD BG", "BG52"),
     "Jdsports CZ": ("JD CZ", "CZ55"),
     "Jdsports HU": ("JD HU", "HU52"),
