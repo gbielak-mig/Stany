@@ -414,7 +414,7 @@ if fetch_btn:
 
     creds_hash_fetch = str(id(get_credentials()))
     try:
-        with st.spinner("Pobieranie 3 okresów równolegle z BigQuery per sklep…"):
+        with st.spinner("Pobieranie danych z BigQuery per sklep…"):
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 future_cur = executor.submit(fetch_period, creds_hash_fetch, TABLE, current[0], current[1], selected_shop)
                 future_prev = executor.submit(fetch_period, creds_hash_fetch, TABLE, prev_week[0], prev_week[1], selected_shop)
