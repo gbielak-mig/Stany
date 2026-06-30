@@ -1,12 +1,17 @@
 """
 BQ Viewer – raport porównawczy (sklep × wszystkie zmienne)
-Zoptymalizowane pobieranie + samo MPK + stałe podsumowanie okresu + ukryte koszty.
-Wymiar 'categoryname' zastąpiony przez 'brand'.
+Trzy zapytania pobierane RÓWNOLEGLE (szybciej), filtr po sklepie w Pandasie
+po stronie klienta — identyczna logika liczenia jak w oryginale.
+
+Dodatkowo: z kolumny `categoryname` (np. "Męskie/Buty/Buty lifestyle")
+wyciągana jest nowa kolumna `podkategoria` zawierająca tylko ostatni
+segment ("Buty lifestyle"), używana zamiast surowego categoryname
+do filtrowania i grupowania.
 """
 
 import os, json, pathlib
 from datetime import date, timedelta
-import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor
 
 import streamlit as st
 import pandas as pd
@@ -15,61 +20,23 @@ from google.oauth2 import service_account
 
 
 # ─────────────────────────────────────────
-# KONFIGURACJA I SŁOWNIK MATRIX (MPK)
+# KONFIGURACJA
 # ─────────────────────────────────────────
 
 TODAY  = date.today()
 
-# Zamieniono 'categoryname' na 'brand'
-CATEGORY_COLS = ["brand", "gender", "season", "seasonality", "type"]
+CATEGORYNAME_COL = "categoryname"   # surowa kolumna z BQ, np. "Męskie/Buty/Buty lifestyle"
+SUBCATEGORY_COL  = "podkategoria"   # nowa kolumna: tylko ostatni segment, np. "Buty lifestyle"
+
+# Lista kolumn używanych do filtrów/grupowania – zamiast surowego categoryname
+# używamy wyliczonej podkategoria (ostatni segment ścieżki).
+CATEGORY_COLS = [brand, SUBCATEGORY_COL, "gender", "season", "seasonality", "type"]
+
 DATE_COL      = "event_date"
 SHOP_COL      = "shop_name"
 INDEX_COL     = "index"
 VARIANTS_COL  = "variants"
 QUANTITY_COL  = "quantity"
-
-# Bazowy słownik mapowania
-RAW_SHOP_DATA = {
-    "Sizeer HR": ("Sizeer HR", "HR50"),
-    "Sizeer BG": ("Sizeer BG", "BG50"),
-    "50Style PL": ("50Style PL", "S501"),
-    "Sizeer LT": ("Sizeer LT", "LT50"),
-    "Sizeer HU": ("Sizeer HU", "HU50"),
-    "Sizeer SI": ("Sizeer SI", "SI50"),
-    "Timberland": ("Timberland", "S502"),
-    "Sizeer RO": ("Sizeer RO [new]", "RO50"),
-    "Buty Sportowe PL": ("Buty Sportowe", "S514"),
-    "Sizeer DE": ("Sizeer DE", "G500"),
-    "Sizeer CZ": ("Sizeer CZ", "CZ50"),
-    "Symbiosis": ("Symbiosis PL", "S507"),
-    "Sizeer LV": ("Sizeer LV", "LV50"),
-    "Sizeer SK": ("Sizeer SK", "SK50"),
-    "Sizeer PL": ("Sizeer PL [new]", "S500"),
-    "Jdsports BG": ("JD BG", "BG52"),
-    "Jdsports CZ": ("JD CZ", "CZ55"),
-    "Jdsports HU": ("JD HU", "HU52"),
-    "Jdsports PL": ("JD PL", "S512"),
-    "Jdsports LT": ("JD LT", "LT52"),
-    "Jdsports RO": ("JD RO", "RO55"),
-    "Jdsports HR": ("JD HR", "HR52"),
-    "Jdsports SK": ("JD SK", "SK52"),
-    "Jdsports UA": ("JD UA", "UA52")
-}
-
-# Funkcja normalizująca tekst do bezpiecznego parowania (usuwa spacje, małe litery)
-def normalize_str(s: str) -> str:
-    return "".join(str(s).split()).lower()
-
-# Dynamiczny słownik z znormalizowanymi kluczami (odporny na formatowanie z DB)
-NORM_SHOP_DATA = {normalize_str(k): v for k, v in RAW_SHOP_DATA.items()}
-
-def get_mpk_code(raw_name: str) -> str:
-    if not raw_name:
-        return raw_name
-    norm_key = normalize_str(raw_name)
-    if norm_key in NORM_SHOP_DATA:
-        return NORM_SHOP_DATA[norm_key][1]  # Zwraca sam kod MPK (np. S501)
-    return raw_name
 
 
 # ─────────────────────────────────────────
@@ -98,6 +65,22 @@ def parse_project(table: str) -> str:
     if len(parts) != 3:
         raise ValueError(f"Zły format tabeli: '{table}'. Oczekiwany: projekt.dataset.tabela")
     return parts[0]
+
+
+# ─────────────────────────────────────────
+# QUERY (bez filtra po sklepie w SQL — tak jak w oryginale)
+# ─────────────────────────────────────────
+
+def build_query(table: str, start: date, end: date) -> str:
+    # Pobieramy surowy categoryname z BQ — podkategoria liczona jest lokalnie w Pandasie.
+    extra_cols = ", ".join(
+        [INDEX_COL, CATEGORYNAME_COL, "gender", "season", "seasonality", "type", VARIANTS_COL, QUANTITY_COL]
+    )
+    return f"""
+    SELECT {SHOP_COL}, {DATE_COL}, {extra_cols}
+    FROM `{table}`
+    WHERE {DATE_COL} BETWEEN '{start.isoformat()}' AND '{end.isoformat()}'
+    """
 
 
 # ─────────────────────────────────────────
@@ -145,30 +128,48 @@ def fetch_shops(_creds_hash: str, table: str) -> list:
 
 
 # ─────────────────────────────────────────
-# QUERY
+# WYLICZANIE PODKATEGORII Z categoryname
 # ─────────────────────────────────────────
 
-def build_query(table: str, start: date, end: date, shop_name: str = None) -> str:
-    extra_cols = ", ".join([INDEX_COL] + CATEGORY_COLS + [VARIANTS_COL, QUANTITY_COL])
-    shop_filter = f"AND {SHOP_COL} = '{shop_name}'" if shop_name else ""
-    
-    return f"""
-    SELECT {SHOP_COL}, {DATE_COL}, {extra_cols}
-    FROM `{table}`
-    WHERE {DATE_COL} BETWEEN '{start.isoformat()}' AND '{end.isoformat()}'
-    {shop_filter}
-    """
+def add_subcategory_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Z 'Męskie/Buty/Buty lifestyle' wyciąga tylko ostatni człon: 'Buty lifestyle'."""
+    if CATEGORYNAME_COL in df.columns:
+        df[SUBCATEGORY_COL] = (
+            df[CATEGORYNAME_COL]
+            .astype(str)
+            .str.split("/")
+            .str[-1]
+            .str.strip()
+        )
+    return df
 
+
+# ─────────────────────────────────────────
+# FETCH OKRESU (bez filtra po sklepie — identycznie jak w oryginale)
+# ─────────────────────────────────────────
 
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_period(_creds_hash: str, table: str, start: date, end: date, shop_name: str) -> pd.DataFrame:
+def fetch_period(_creds_hash: str, table: str, start: date, end: date) -> pd.DataFrame:
     project = parse_project(table)
     client  = bigquery.Client(credentials=get_credentials(), project=project)
-    job     = client.query(build_query(table, start, end, shop_name))
+    job     = client.query(build_query(table, start, end))
     df      = job.result().to_dataframe()
     if DATE_COL in df.columns:
         df[DATE_COL] = pd.to_datetime(df[DATE_COL]).dt.date
+    df = add_subcategory_column(df)
     return df
+
+
+def fetch_all_periods(creds_hash: str, table: str, current, prev_week, prev_year) -> dict:
+    """Pobiera 3 okresy RÓWNOLEGLE (każdy w osobnym wątku/job BQ) — szybciej,
+    bez zmiany logiki zapytania względem oryginału."""
+    periods = {"cur": current, "prev": prev_week, "year": prev_year}
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futures = {
+            key: ex.submit(fetch_period, creds_hash, table, start, end)
+            for key, (start, end) in periods.items()
+        }
+        return {key: f.result() for key, f in futures.items()}
 
 
 # ─────────────────────────────────────────
@@ -214,10 +215,23 @@ def sum_col(df: pd.DataFrame, col: str) -> int:
     return 0
 
 
+def delta_breakdown(df_cur: pd.DataFrame, df_other: pd.DataFrame, index_col: str = INDEX_COL):
+    """Ile produktów (unikalnych index) zostało dodanych, a ile odjętych
+    między df_other (poprzedni/rok wcześniej) a df_cur (bieżący)."""
+    if index_col not in df_cur.columns or index_col not in df_other.columns:
+        return None, None
+    cur_set   = set(df_cur[index_col].dropna().unique())
+    other_set = set(df_other[index_col].dropna().unique())
+    added   = len(cur_set - other_set)   # są teraz, nie było ich wcześniej
+    removed = len(other_set - cur_set)   # były wcześniej, nie ma teraz
+    return added, removed
+
+
 def build_summary_all(df: pd.DataFrame, group_cols: list) -> pd.DataFrame:
+    """Agregacja po wszystkich zmiennych grupowania."""
     if not group_cols:
         return pd.DataFrame()
-    
+
     if INDEX_COL in df.columns:
         out = (
             df.groupby(group_cols)[INDEX_COL]
@@ -231,9 +245,10 @@ def build_summary_all(df: pd.DataFrame, group_cols: list) -> pd.DataFrame:
 
 
 def build_variants_summary_all(df: pd.DataFrame, group_cols: list) -> pd.DataFrame:
+    """Agregacja variants i quantity po wszystkich zmiennych."""
     if not group_cols:
         return pd.DataFrame()
-    
+
     agg = {}
     if VARIANTS_COL in df.columns:
         agg[VARIANTS_COL] = "sum"
@@ -247,13 +262,14 @@ def build_variants_summary_all(df: pd.DataFrame, group_cols: list) -> pd.DataFra
 
 
 def compare_periods_all(df_cur, df_prev, df_year, group_cols) -> pd.DataFrame:
+    """Porównanie trzech okresów - wszystkie zmienne."""
     cur  = build_summary_all(df_cur,  group_cols).rename(columns={"produkty": "bieżący"})
     prev = build_summary_all(df_prev, group_cols).rename(columns={"produkty": "poprzedni"})
     year = build_summary_all(df_year, group_cols).rename(columns={"produkty": "rok wcześniej"})
-    
+
     merged = cur.merge(prev, on=group_cols, how="outer").fillna(0)
     merged = merged.merge(year, on=group_cols, how="outer").fillna(0)
-    
+
     merged["bieżący"]       = merged["bieżący"].astype(int)
     merged["poprzedni"]     = merged["poprzedni"].astype(int)
     merged["rok wcześniej"] = merged["rok wcześniej"].astype(int)
@@ -263,11 +279,12 @@ def compare_periods_all(df_cur, df_prev, df_year, group_cols) -> pd.DataFrame:
         if r["poprzedni"] > 0 else ("nowe" if r["bieżący"] > 0 else "–"),
         axis=1,
     )
-    
+
     return merged.sort_values("bieżący", ascending=False)
 
 
 def compare_variants_periods_all(df_cur, df_prev, df_year, group_cols) -> pd.DataFrame:
+    """Porównanie variants/quantity trzech okresów."""
     cur  = build_variants_summary_all(df_cur,  group_cols)
     prev = build_variants_summary_all(df_prev, group_cols)
     year = build_variants_summary_all(df_year, group_cols)
@@ -284,12 +301,12 @@ def compare_variants_periods_all(df_cur, df_prev, df_year, group_cols) -> pd.Dat
         col_cur  = f"{col}_cur"
         col_prev = f"{col}_prev"
         col_year = f"{col}_year"
-        
+
         if col_cur in merged.columns:
             merged[col_cur]  = merged[col_cur].astype(int)
             merged[col_prev] = merged[col_prev].astype(int)
             merged[col_year] = merged[col_year].astype(int) if col_year in merged.columns else 0
-            
+
             result[f"{col} (bież.)"]  = merged[col_cur]
             result[f"{col} (poprz.)"] = merged[col_prev]
             result[f"{col} (rok temu)"] = merged[col_year]
@@ -318,16 +335,19 @@ h1, h2, h3 { font-weight: 800; }
 div[data-testid="stSidebar"] { background: #111; border-right: 1px solid #222; }
 .cost-box {
     background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 8px;
-    padding: 12px 18px; font-size: 0.82rem; color: #aaa; margin-bottom: 2px;
+    padding: 12px 18px; font-size: 0.82rem; color: #aaa; margin-bottom: 8px;
 }
-.cost-box strong { color: #2ecc71; }
+.cost-box strong { color: #ffd700; }
+.cost-box .label { font-size: 0.62rem; text-transform: uppercase; letter-spacing: 2px; color: #555; }
 .period-label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 2px; color: #666; margin-bottom: 2px; }
 .filter-tag {
     display: inline-block; background: #1e2a1e; border: 1px solid #2ecc71;
     border-radius: 4px; padding: 2px 8px; font-size: 0.72rem; color: #2ecc71;
     margin: 2px 3px 2px 0;
 }
-.gross-box { font-size: 0.85rem; margin-top: -8px; margin-bottom: 12px; font-weight: 600; }
+.breakdown-line { font-size: 0.78rem; margin-top: 2px; }
+.breakdown-added { color: #2ecc71; }
+.breakdown-removed { color: #e74c3c; margin-left: 10px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -342,13 +362,18 @@ with st.sidebar:
 
     TABLE = st.secrets.get("STANY") or st.secrets.get("stany")
     if not TABLE:
-        st.error("Brak tabeli w secrets.toml.")
+        available = list(st.secrets.keys())
+        st.error(
+            "Brak tabeli w secrets.toml. Dodaj linię:\n\n"
+            "`STANY = \"projekt.dataset.tabela\"`\n\n"
+            f"Dostępne klucze w secrets: `{available}`"
+        )
         st.stop()
 
     st.caption(f"📋 `{TABLE}`")
     st.markdown("---")
 
-    # ── Sklep (WYŚWIETLANIE SAMEGO KODU MPK) ──────────────────────────────────
+    # ── Sklep ───────────────────────────────────────────────────────────────
     creds_hash = str(id(get_credentials()))
     try:
         shops_list = fetch_shops(creds_hash, TABLE)
@@ -357,11 +382,7 @@ with st.sidebar:
         st.warning(f"Nie można pobrać listy sklepów: {e}")
 
     if shops_list:
-        selected_shop = st.selectbox(
-            "🏪 Wybierz MPK", 
-            shops_list, 
-            format_func=get_mpk_code
-        )
+        selected_shop = st.selectbox("🏪 Sklep", shops_list)
     else:
         selected_shop = None
         st.info("Brak danych o sklepach.")
@@ -406,38 +427,38 @@ with st.sidebar:
 
     st.caption(
         f"**Bieżący:** {current[0]} → {current[1]} ({n_days} dni)\n\n"
-        f"**Poprzedni:** {prev_week[0]} → {prev_week[1]}" + (" ✏️" if override_prev else "") + "\n\n"
-        f"**Rok wcześniej:** {prev_year[0]} → {prev_year[1]}" + (" ✏️" if override_year else "")
+        f"**Poprzedni:** {prev_week[0]} → {prev_week[1]}"
+        + (" ✏️" if override_prev else "") + "\n\n"
+        f"**Rok wcześniej:** {prev_year[0]} → {prev_year[1]}"
+        + (" ✏️" if override_year else "")
     )
     st.markdown("---")
 
-    # ── SZACOWANY KOSZT (DOMYŚLNIE UKRYTY) ───────────────────────────────────
-    with st.expander("💰 Szacowany koszt", expanded=False):
-        est = estimate_cost_all(TABLE, [current, prev_week, prev_year])
-        if est["ok"]:
-            color = "#2ecc71" if est["cost_usd"] < 0.01 else "#ffd700" if est["cost_usd"] < 0.10 else "#ff9f4d"
-            st.markdown(f"""
-            <div class="cost-box">
-                <strong style="color:{color}">${est['cost_usd']:.6f}</strong>
-                &nbsp;·&nbsp; <strong>{est['gb']:.4f} GB</strong>
-                <div style="font-size:0.68rem;color:#555;margin-top:4px">dry run · $5/TB · 3 zapytania</div>
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            st.warning(f"Dry run failed: {est.get('error', '?')}")
+    # ── Dry run ─────────────────────────────────────────────────────────────
+    est = estimate_cost_all(TABLE, [current, prev_week, prev_year])
+    if est["ok"]:
+        color = "#2ecc71" if est["cost_usd"] < 0.01 else "#ffd700" if est["cost_usd"] < 0.10 else "#ff9f4d"
+        st.markdown(f"""
+        <div class="cost-box">
+            <div class="label">Szacowany koszt (3 zapytania)</div>
+            <strong style="color:{color}">${est['cost_usd']:.6f}</strong>
+            &nbsp;·&nbsp; <strong>{est['gb']:.4f} GB</strong>
+            <div style="font-size:0.68rem;color:#555;margin-top:4px">dry run · $5/TB · 3 osobne query</div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.warning(f"Dry run failed: {est.get('error', '?')}")
 
     st.markdown("")
     fetch_btn = st.button("🚀 Pobierz dane", use_container_width=True, type="primary")
 
 
 # ─────────────────────────────────────────
-# MAIN RAPORT
+# MAIN
 # ─────────────────────────────────────────
 
-shop_display = get_mpk_code(selected_shop)
-
 st.markdown("# 📊 BQ Raport")
-st.markdown(f"`{TABLE}` &nbsp;·&nbsp; MPK: `{shop_display}` &nbsp;·&nbsp; bieżący okres: `{current[0]}` → `{current[1]}`")
+st.markdown(f"`{TABLE}` &nbsp;·&nbsp; bieżący okres: `{current[0]}` → `{current[1]}`")
 st.markdown("---")
 
 if "df_cur" not in st.session_state:
@@ -446,24 +467,17 @@ if "df_cur" not in st.session_state:
     st.session_state.df_year = None
 
 if fetch_btn:
-    if not selected_shop:
-        st.error("Wybierz najpierw MPK!")
-        st.stop()
-
     creds_hash_fetch = str(id(get_credentials()))
     try:
-        with st.spinner(f"Pobieranie danych z BigQuery dla MPK {shop_display}…"):
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future_cur = executor.submit(fetch_period, creds_hash_fetch, TABLE, current[0], current[1], selected_shop)
-                future_prev = executor.submit(fetch_period, creds_hash_fetch, TABLE, prev_week[0], prev_week[1], selected_shop)
-                future_year = executor.submit(fetch_period, creds_hash_fetch, TABLE, prev_year[0], prev_year[1], selected_shop)
-                
-                st.session_state.df_cur = future_cur.result()
-                st.session_state.df_prev = future_prev.result()
-                st.session_state.df_year = future_year.result()
+        with st.spinner("Pobieranie 3 okresów równolegle…"):
+            results = fetch_all_periods(creds_hash_fetch, TABLE, current, prev_week, prev_year)
 
-        total = len(st.session_state.df_cur) + len(st.session_state.df_prev) + len(st.session_state.df_year)
-        st.sidebar.success(f"✅ {total:,} wierszy dla {shop_display}")
+        st.session_state.df_cur  = results["cur"]
+        st.session_state.df_prev = results["prev"]
+        st.session_state.df_year = results["year"]
+
+        total = sum(len(d) for d in results.values())
+        st.sidebar.success(f"✅ {total:,} wierszy łącznie")
         st.rerun()
     except Exception as e:
         st.error(f"❌ Błąd: {e}")
@@ -477,17 +491,22 @@ if df_cur is None:
     st.info("Kliknij **Pobierz dane** w panelu bocznym, aby załadować raport.")
     st.stop()
 
-# Filtrowanie (bezpiecznik)
+if selected_shop is None:
+    st.warning("Wybierz sklep w panelu bocznym.")
+    st.stop()
+
+# ── Filtrowanie po sklepie (w Pandasie — tak jak w oryginale) ───────────────
 df_cur_s  = df_cur[df_cur[SHOP_COL]   == selected_shop].copy()
 df_prev_s = df_prev[df_prev[SHOP_COL] == selected_shop].copy()
 df_year_s = df_year[df_year[SHOP_COL] == selected_shop].copy()
 
-
 # ─────────────────────────────────────────
-# FILTRY
+# FILTRY (na górze strony głównej)
 # ─────────────────────────────────────────
 st.markdown("### 🎛️ Filtry")
-filter_cols = [c for c in CATEGORY_COLS if c in df_cur_s.columns]
+
+ALL_FILTER_COLS = CATEGORY_COLS  # zawiera 'podkategoria' zamiast surowego categoryname
+filter_cols = [c for c in ALL_FILTER_COLS if c in df_cur_s.columns]
 
 active_filters = {}
 if filter_cols:
@@ -496,11 +515,19 @@ if filter_cols:
     for i, fc in enumerate(filter_cols):
         with fcols[i % n_filter_cols]:
             unique_vals = sorted(df_cur_s[fc].dropna().unique().tolist())
-            selected = st.multiselect(f"{fc}", options=unique_vals, default=[], key=f"filter_{fc}")
+            label = "kategoria" if fc == SUBCATEGORY_COL else fc
+            selected = st.multiselect(
+                label,
+                options=unique_vals,
+                default=[],
+                key=f"filter_{fc}",
+            )
             if selected:
                 active_filters[fc] = selected
 
+# ── Zastosuj filtry ──────────────────────────────────────────────────────────
 def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
+    """Filtry multiselect – dla każdej kolumny OR między wartościami, AND między kolumnami."""
     for col, vals in filters.items():
         if col in df.columns and vals:
             df = df[df[col].isin(vals)]
@@ -510,116 +537,162 @@ df_cur_f  = apply_filters(df_cur_s.copy(),  active_filters)
 df_prev_f = apply_filters(df_prev_s.copy(), active_filters)
 df_year_f = apply_filters(df_year_s.copy(), active_filters)
 
+# ── Pokaż aktywne filtry ─────────────────────────────────────────────────────
 if active_filters:
-    tags_html = "".join(f'<span class="filter-tag">{col}: {val}</span>' for col, val in active_filters.items())
+    tags_html = "".join(
+        f'<span class="filter-tag">{col}: {val}</span>' for col, val in active_filters.items()
+    )
     st.markdown(f"**Aktywne filtry:** {tags_html}", unsafe_allow_html=True)
 
 st.markdown("---")
 
-
 # ─────────────────────────────────────────
-# OBLICZENIA GROSS CHANGES
+# PODSUMOWANIE OKRESU
 # ─────────────────────────────────────────
-set_cur = set(df_cur_f[INDEX_COL].dropna().unique()) if INDEX_COL in df_cur_f.columns else set()
-set_prev = set(df_prev_f[INDEX_COL].dropna().unique()) if INDEX_COL in df_prev_f.columns else set()
-p_added = len(set_cur - set_prev)
-p_removed = len(set_prev - set_cur)
-
-def get_gross_changes(df_c, df_p, col):
-    if col not in df_c.columns or INDEX_COL not in df_c.columns:
-        return 0, 0
-    c_sum = df_c.groupby(INDEX_COL)[col].sum()
-    p_sum = df_p.groupby(INDEX_COL)[col].sum()
-    merged = pd.concat([c_sum, p_sum], axis=1, keys=['cur', 'prev']).fillna(0)
-    diff = merged['cur'] - merged['prev']
-    return int(diff[diff > 0].sum()), int(abs(diff[diff < 0].sum()))
-
-v_added, v_removed = get_gross_changes(df_cur_f, df_prev_f, VARIANTS_COL)
-q_added, q_removed = get_gross_changes(df_cur_f, df_prev_f, QUANTITY_COL)
-
-
-# ─────────────────────────────────────────
-# PODSUMOWANIE OKRESU (STAŁE - CAŁY CZAS WIDOCZNE)
-# ─────────────────────────────────────────
-def delta_str(cur_val, prev_val):
-    if prev_val == 0: return None
-    d = cur_val - prev_val
-    return f"{d:+,} ({d/prev_val*100:+.1f}%)"
-
-n_cur, n_prev, n_year = count_products(df_cur_f), count_products(df_prev_f), count_products(df_year_f)
-v_cur, v_prev, v_year = sum_col(df_cur_f, VARIANTS_COL), sum_col(df_prev_f, VARIANTS_COL), sum_col(df_year_f, VARIANTS_COL)
-q_cur, q_prev, q_year = sum_col(df_cur_f, QUANTITY_COL), sum_col(df_prev_f, QUANTITY_COL), sum_col(df_year_f, QUANTITY_COL)
-
 st.markdown("### 📦 Podsumowanie okresu")
 
-st.markdown('<div class="period-label">Bieżący okres vs poprzedni</div>', unsafe_allow_html=True)
+def delta_str(cur_val, prev_val):
+    if prev_val == 0:
+        return None
+    d   = cur_val - prev_val
+    pct = d / prev_val * 100
+    return f"{d:+,} ({pct:+.1f}%)"
+
+def render_breakdown(added, removed):
+    """Render zielono/czerwono: ile dodanych, ile odjętych produktów."""
+    if added is None:
+        return
+    st.markdown(
+        f'<div class="breakdown-line">'
+        f'<span class="breakdown-added">▲ {added:,} dodanych</span>'
+        f'<span class="breakdown-removed">▼ {removed:,} usuniętych</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+n_cur  = count_products(df_cur_f)
+n_prev = count_products(df_prev_f)
+n_year = count_products(df_year_f)
+
+v_cur  = sum_col(df_cur_f,  VARIANTS_COL)
+v_prev = sum_col(df_prev_f, VARIANTS_COL)
+v_year = sum_col(df_year_f, VARIANTS_COL)
+
+q_cur  = sum_col(df_cur_f,  QUANTITY_COL)
+q_prev = sum_col(df_prev_f, QUANTITY_COL)
+q_year = sum_col(df_year_f, QUANTITY_COL)
+
+# breakdown produktów (dodane/odjęte) liczony na zbiorach unikalnych index
+added_w, removed_w = delta_breakdown(df_cur_f, df_prev_f)
+added_y, removed_y = delta_breakdown(df_cur_f, df_year_f)
+
+st.markdown('<div class="period-label">Bieżący okres</div>', unsafe_allow_html=True)
 r1c1, r1c2, r1c3 = st.columns(3)
 with r1c1:
     st.metric(f"📦 Produkty · {current[0]} → {current[1]}", f"{n_cur:,}", delta=delta_str(n_cur, n_prev))
-    st.markdown(f'<div class="gross-box"><span style="color:#2ecc71">▲ +{p_added:,}</span> &nbsp;&nbsp;&nbsp; <span style="color:#e74c3c">▼ -{p_removed:,}</span></div>', unsafe_allow_html=True)
+    render_breakdown(added_w, removed_w)
 with r1c2:
     st.metric("🔢 Variants", f"{v_cur:,}", delta=delta_str(v_cur, v_prev))
-    st.markdown(f'<div class="gross-box"><span style="color:#2ecc71">▲ +{v_added:,}</span> &nbsp;&nbsp;&nbsp; <span style="color:#e74c3c">▼ -{v_removed:,}</span></div>', unsafe_allow_html=True)
 with r1c3:
     st.metric("📊 Quantity", f"{q_cur:,}", delta=delta_str(q_cur, q_prev))
-    st.markdown(f'<div class="gross-box"><span style="color:#2ecc71">▲ +{q_added:,}</span> &nbsp;&nbsp;&nbsp; <span style="color:#e74c3c">▼ -{q_removed:,}</span></div>', unsafe_allow_html=True)
 
 st.markdown('<div class="period-label" style="margin-top:14px">Poprzedni okres</div>', unsafe_allow_html=True)
 r2c1, r2c2, r2c3 = st.columns(3)
-with r2c1: st.metric(f"📦 Produkty · {prev_week[0]} → {prev_week[1]}", f"{n_prev:,}")
-with r2c2: st.metric("🔢 Variants", f"{v_prev:,}")
-with r2c3: st.metric("📊 Quantity", f"{q_prev:,}")
+with r2c1:
+    st.metric(f"📦 Produkty · {prev_week[0]} → {prev_week[1]}", f"{n_prev:,}")
+with r2c2:
+    st.metric("🔢 Variants", f"{v_prev:,}")
+with r2c3:
+    st.metric("📊 Quantity", f"{q_prev:,}")
 
 st.markdown('<div class="period-label" style="margin-top:14px">Rok wcześniej</div>', unsafe_allow_html=True)
 r3c1, r3c2, r3c3 = st.columns(3)
-with r3c1: st.metric(f"📦 Produkty · {prev_year[0]} → {prev_year[1]}", f"{n_year:,}", delta=delta_str(n_cur, n_year))
-with r3c2: st.metric("🔢 Variants", f"{v_year:,}", delta=delta_str(v_cur, v_year))
-with r3c3: st.metric("📊 Quantity", f"{q_year:,}", delta=delta_str(q_cur, q_year))
+with r3c1:
+    st.metric(f"📦 Produkty · {prev_year[0]} → {prev_year[1]}", f"{n_year:,}", delta=delta_str(n_cur, n_year))
+    render_breakdown(added_y, removed_y)
+with r3c2:
+    st.metric("🔢 Variants", f"{v_year:,}", delta=delta_str(v_cur, v_year))
+with r3c3:
+    st.metric("📊 Quantity", f"{q_year:,}", delta=delta_str(q_cur, q_year))
 
 st.markdown("---")
 
+# ─────────────────────────────────────────
+# AGREGACJA PO WSZYSTKICH ZMIENNYCH FILTRÓW
+# ─────────────────────────────────────────
+
+group_cols_all = [c for c in CATEGORY_COLS if c in df_cur_f.columns]
 
 # ─────────────────────────────────────────
-# TABS Z WYNIKAMI
+# BOOK: Produkty / Variants / Quantity
 # ─────────────────────────────────────────
-group_cols_all = [c for c in CATEGORY_COLS if c in df_cur_f.columns]
+
 book_tab1, book_tab2, book_tab3 = st.tabs(["📦 Produkty", "🔢 Variants", "📊 Quantity"])
 
 def styled_df(cmp):
+    """Color styling dla kolumn zmiana %."""
     pct_cols = [c for c in cmp.columns if "zmiana %" in c]
     def color_col(col):
         if col.name in pct_cols:
-            return ["color: #2ecc71" if str(v).startswith("+") else "color: #e74c3c" if str(v).startswith("-") else "" for v in col]
+            return [
+                "color: #2ecc71" if str(v).startswith("+") else
+                "color: #e74c3c" if str(v).startswith("-") else ""
+                for v in col
+            ]
         return [""] * len(col)
     return cmp.style.apply(color_col, axis=0)
 
+# ── TAB 1: Produkty (unikalne indeksy) ───────────────────────────────────────
 with book_tab1:
     cmp = compare_periods_all(df_cur_f, df_prev_f, df_year_f, group_cols_all)
+    st.markdown(
+        f"**{selected_shop}** · "
+        f"{current[0]}→{current[1]} vs {prev_week[0]}→{prev_week[1]} vs {prev_year[0]}→{prev_year[1]}"
+    )
     st.dataframe(styled_df(cmp), use_container_width=True, height=500)
 
+# ── TAB 2: Variants (suma) ───────────────────────────────────────────────────
 with book_tab2:
     if VARIANTS_COL not in df_cur_s.columns:
-        st.warning(f"Brak kolumny `{VARIANTS_COL}`.")
+        st.warning(f"Brak kolumny `{VARIANTS_COL}` w danych.")
     else:
         cmp_var = compare_variants_periods_all(df_cur_f, df_prev_f, df_year_f, group_cols_all)
-        if not cmp_var.empty:
-            v_cols = [c for c in cmp_var.columns if "variants" in c.lower()]
-            st.dataframe(styled_df(cmp_var[group_cols_all + v_cols]), use_container_width=True, height=500)
+        st.markdown(
+            f"**{selected_shop}** · "
+            f"{current[0]}→{current[1]} vs {prev_week[0]}→{prev_week[1]} vs {prev_year[0]}→{prev_year[1]}"
+        )
+        if cmp_var.empty:
+            st.info("Brak danych.")
+        else:
+            var_cols = [c for c in cmp_var.columns if "variants" in c.lower()]
+            display_cols = group_cols_all + var_cols
+            display_cols = [c for c in display_cols if c in cmp_var.columns]
+            st.dataframe(styled_df(cmp_var[display_cols]), use_container_width=True, height=500)
 
+# ── TAB 3: Quantity (suma) ───────────────────────────────────────────────────
 with book_tab3:
     if QUANTITY_COL not in df_cur_s.columns:
-        st.warning(f"Brak kolumny `{QUANTITY_COL}`.")
+        st.warning(f"Brak kolumny `{QUANTITY_COL}` w danych.")
     else:
         cmp_qty = compare_variants_periods_all(df_cur_f, df_prev_f, df_year_f, group_cols_all)
-        if not cmp_qty.empty:
-            q_cols = [c for c in cmp_qty.columns if "quantity" in c.lower()]
-            st.dataframe(styled_df(cmp_qty[group_cols_all + q_cols]), use_container_width=True, height=500)
+        st.markdown(
+            f"**{selected_shop}** · "
+            f"{current[0]}→{current[1]} vs {prev_week[0]}→{prev_week[1]} vs {prev_year[0]}→{prev_year[1]}"
+        )
+        if cmp_qty.empty:
+            st.info("Brak danych.")
+        else:
+            qty_cols = [c for c in cmp_qty.columns if "quantity" in c.lower()]
+            display_cols = group_cols_all + qty_cols
+            display_cols = [c for c in display_cols if c in cmp_qty.columns]
+            st.dataframe(styled_df(cmp_qty[display_cols]), use_container_width=True, height=500)
 
-# Eksport
+# ── Eksport ──────────────────────────────────────────────────────────────────
 st.markdown("---")
+csv = df_cur_f.to_csv(index=False).encode("utf-8")
 st.download_button(
     "⬇️ Pobierz bieżący okres CSV",
-    data=df_cur_f.to_csv(index=False).encode("utf-8"),
-    file_name=f"bq_{shop_display}_{current[0]}_{current[1]}.csv",
+    data=csv,
+    file_name=f"bq_{selected_shop}_{current[0]}_{current[1]}.csv",
     mime="text/csv",
 )
