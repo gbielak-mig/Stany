@@ -20,10 +20,9 @@ from google.oauth2 import service_account
 
 TODAY  = date.today()
 
-CATEGORYNAME_COL     = "categoryname"      # surowa kolumna z BQ, np. "Męskie/Buty/Buty lifestyle"
+CATEGORYNAME_COL     = "categoryname"        # surowa kolumna z BQ, np. "Męskie/Buty/Buty lifestyle"
 CATEGORYNAME_LAST_COL = "categoryname_last"   # nowa kolumna: tylko ostatni segment, np. "Buty lifestyle"
 
-# DODANO: Kolumna categoryname_last jest teraz pełnoprawną zmienną w raportach i filtrach
 CATEGORY_COLS = ["brand", "gender", "season", "seasonality", "type", CATEGORYNAME_LAST_COL]
 
 DATE_COL      = "event_date"
@@ -62,16 +61,13 @@ def parse_project(table: str) -> str:
 
 
 # ─────────────────────────────────────────
-# QUERY (Poprawione pobieranie kolumny categoryname)
+# QUERY (bez filtra po sklepie w SQL — tak jak w oryginale)
 # ─────────────────────────────────────────
 
 def build_query(table: str, start: date, end: date) -> str:
-    # Pobieramy podstawowe kolumny (brand, gender, season, seasonality, type)
-    base_cols = [c for c in CATEGORY_COLS if c != CATEGORYNAME_LAST_COL]
-    
-    # Do zapytania SQL jawnie dodajemy surową kolumnę CATEGORYNAME_COL ("categoryname")
-    sql_cols = base_cols + [CATEGORYNAME_COL]
-    
+    # CATEGORY_COLS zawiera categoryname_last (liczone lokalnie) — w SQL pobieramy
+    # surowy categoryname zamiast niego, plus pozostałe kolumny z CATEGORY_COLS.
+    sql_cols = [c for c in CATEGORY_COLS if c != CATEGORYNAME_LAST_COL] + [CATEGORYNAME_COL]
     extra_cols = ", ".join([INDEX_COL] + sql_cols + [VARIANTS_COL, QUANTITY_COL])
     return f"""
     SELECT {SHOP_COL}, {DATE_COL}, {extra_cols}
@@ -102,7 +98,6 @@ def estimate_cost_all(table: str, periods: list) -> dict:
     total_gb   = 0
     total_cost = 0
     for start, end in periods:
-        st.write()
         est = estimate_cost_single(table, start, end)
         if not est["ok"]:
             return est
@@ -125,6 +120,7 @@ def fetch_shops(_creds_hash: str, table: str) -> list:
     return sorted(df[SHOP_COL].dropna().tolist())
 
 
+
 # ─────────────────────────────────────────
 # WYLICZANIE OSTATNIEGO SEGMENTU categoryname
 # ─────────────────────────────────────────
@@ -143,7 +139,7 @@ def add_categoryname_last_column(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────
-# FETCH OKRESU
+# FETCH OKRESU (bez filtra po sklepie — identycznie jak w oryginale)
 # ─────────────────────────────────────────
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -159,6 +155,8 @@ def fetch_period(_creds_hash: str, table: str, start: date, end: date) -> pd.Dat
 
 
 def fetch_all_periods(creds_hash: str, table: str, current, prev_week, prev_year) -> dict:
+    """Pobiera 3 okresy RÓWNOLEGLE (każdy w osobnym wątku/job BQ) — szybciej,
+    bez zmiany logiki zapytania względem oryginału."""
     periods = {"cur": current, "prev": prev_week, "year": prev_year}
     with ThreadPoolExecutor(max_workers=3) as ex:
         futures = {
@@ -212,16 +210,19 @@ def sum_col(df: pd.DataFrame, col: str) -> int:
 
 
 def delta_breakdown(df_cur: pd.DataFrame, df_other: pd.DataFrame, index_col: str = INDEX_COL):
+    """Ile produktów (unikalnych index) zostało dodanych, a ile odjętych
+    między df_other (poprzedni/rok wcześniej) a df_cur (bieżący)."""
     if index_col not in df_cur.columns or index_col not in df_other.columns:
         return None, None
     cur_set   = set(df_cur[index_col].dropna().unique())
     other_set = set(df_other[index_col].dropna().unique())
-    added   = len(cur_set - other_set)
-    removed = len(other_set - cur_set)
+    added   = len(cur_set - other_set)   # są teraz, nie było ich wcześniej
+    removed = len(other_set - cur_set)   # były wcześniej, nie ma teraz
     return added, removed
 
 
 def build_summary_all(df: pd.DataFrame, group_cols: list) -> pd.DataFrame:
+    """Agregacja po wszystkich zmiennych grupowania."""
     if not group_cols:
         return pd.DataFrame()
 
@@ -238,6 +239,7 @@ def build_summary_all(df: pd.DataFrame, group_cols: list) -> pd.DataFrame:
 
 
 def build_variants_summary_all(df: pd.DataFrame, group_cols: list) -> pd.DataFrame:
+    """Agregacja variants i quantity po wszystkich zmiennych."""
     if not group_cols:
         return pd.DataFrame()
 
@@ -254,6 +256,7 @@ def build_variants_summary_all(df: pd.DataFrame, group_cols: list) -> pd.DataFra
 
 
 def compare_periods_all(df_cur, df_prev, df_year, group_cols) -> pd.DataFrame:
+    """Porównanie trzech okresów - wszystkie zmienne."""
     cur  = build_summary_all(df_cur,  group_cols).rename(columns={"produkty": "bieżący"})
     prev = build_summary_all(df_prev, group_cols).rename(columns={"produkty": "poprzedni"})
     year = build_summary_all(df_year, group_cols).rename(columns={"produkty": "rok wcześniej"})
@@ -275,6 +278,7 @@ def compare_periods_all(df_cur, df_prev, df_year, group_cols) -> pd.DataFrame:
 
 
 def compare_variants_periods_all(df_cur, df_prev, df_year, group_cols) -> pd.DataFrame:
+    """Porównanie variants/quantity trzech okresów."""
     cur  = build_variants_summary_all(df_cur,  group_cols)
     prev = build_variants_summary_all(df_prev, group_cols)
     year = build_variants_summary_all(df_year, group_cols)
@@ -356,7 +360,7 @@ with st.sidebar:
         st.error(
             "Brak tabeli w secrets.toml. Dodaj linię:\n\n"
             "`STANY = \"projekt.dataset.tabela\"`\n\n"
-            "Dostępne klucze w secrets: `{available}`"
+            f"Dostępne klucze w secrets: `{available}`"
         )
         st.stop()
 
@@ -500,7 +504,7 @@ filter_cols = [c for c in ALL_FILTER_COLS if c in df_cur_s.columns]
 
 active_filters = {}
 if filter_cols:
-    n_filter_cols = min(len(filter_cols), 6) # Zwiększono limit kolumn w rzędzie do 6 ze względu na nową kolumnę
+    n_filter_cols = min(len(filter_cols), 5)
     fcols = st.columns(n_filter_cols)
     for i, fc in enumerate(filter_cols):
         with fcols[i % n_filter_cols]:
@@ -516,6 +520,7 @@ if filter_cols:
 
 # ── Zastosuj filtry ──────────────────────────────────────────────────────────
 def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
+    """Filtry multiselect – dla każdej kolumny OR między wartościami, AND między kolumnami."""
     for col, vals in filters.items():
         if col in df.columns and vals:
             df = df[df[col].isin(vals)]
@@ -547,6 +552,7 @@ def delta_str(cur_val, prev_val):
     return f"{d:+,} ({pct:+.1f}%)"
 
 def render_breakdown(added, removed):
+    """Render zielono/czerwono: ile dodanych, ile odjętych produktów."""
     if added is None:
         return
     st.markdown(
@@ -569,6 +575,7 @@ q_cur  = sum_col(df_cur_f,  QUANTITY_COL)
 q_prev = sum_col(df_prev_f, QUANTITY_COL)
 q_year = sum_col(df_year_f, QUANTITY_COL)
 
+# breakdown produktów (dodane/odjęte) liczony na zbiorach unikalnych index
 added_w, removed_w = delta_breakdown(df_cur_f, df_prev_f)
 added_y, removed_y = delta_breakdown(df_cur_f, df_year_f)
 
@@ -616,6 +623,7 @@ group_cols_all = [c for c in CATEGORY_COLS if c in df_cur_f.columns]
 book_tab1, book_tab2, book_tab3 = st.tabs(["📦 Produkty", "🔢 Variants", "📊 Quantity"])
 
 def styled_df(cmp):
+    """Color styling dla kolumn zmiana %."""
     pct_cols = [c for c in cmp.columns if "zmiana %" in c]
     def color_col(col):
         if col.name in pct_cols:
