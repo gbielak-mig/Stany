@@ -2,11 +2,6 @@
 BQ Viewer – raport porównawczy (sklep × wszystkie zmienne)
 Trzy zapytania pobierane RÓWNOLEGLE (szybciej), filtr po sklepie w Pandasie
 po stronie klienta — identyczna logika liczenia jak w oryginale.
-
-Dodatkowo: z kolumny `categoryname` (np. "Męskie/Buty/Buty lifestyle")
-wyciągana jest nowa kolumna `podkategoria` zawierająca tylko ostatni
-segment ("Buty lifestyle"), używana zamiast surowego categoryname
-do filtrowania i grupowania.
 """
 
 import os, json, pathlib
@@ -25,12 +20,10 @@ from google.oauth2 import service_account
 
 TODAY  = date.today()
 
-CATEGORYNAME_COL = "categoryname"   # surowa kolumna z BQ, np. "Męskie/Buty/Buty lifestyle"
-SUBCATEGORY_COL  = "podkategoria"   # nowa kolumna: tylko ostatni segment, np. "Buty lifestyle"
+CATEGORYNAME_COL     = "categoryname"        # surowa kolumna z BQ, np. "Męskie/Buty/Buty lifestyle"
+CATEGORYNAME_LAST_COL = "categoryname_last"   # nowa kolumna: tylko ostatni segment, np. "Buty lifestyle"
 
-# Lista kolumn używanych do filtrów/grupowania – zamiast surowego categoryname
-# używamy wyliczonej podkategoria (ostatni segment ścieżki).
-CATEGORY_COLS = [brand, SUBCATEGORY_COL, "gender", "season", "seasonality", "type"]
+CATEGORY_COLS = ["brand", "gender", "season", "seasonality", "type", CATEGORYNAME_LAST_COL]
 
 DATE_COL      = "event_date"
 SHOP_COL      = "shop_name"
@@ -72,10 +65,10 @@ def parse_project(table: str) -> str:
 # ─────────────────────────────────────────
 
 def build_query(table: str, start: date, end: date) -> str:
-    # Pobieramy surowy categoryname z BQ — podkategoria liczona jest lokalnie w Pandasie.
-    extra_cols = ", ".join(
-        [INDEX_COL, CATEGORYNAME_COL, "gender", "season", "seasonality", "type", VARIANTS_COL, QUANTITY_COL]
-    )
+    # CATEGORY_COLS zawiera categoryname_last (liczone lokalnie) — w SQL pobieramy
+    # surowy categoryname zamiast niego, plus pozostałe kolumny z CATEGORY_COLS.
+    sql_cols = [c for c in CATEGORY_COLS if c != CATEGORYNAME_LAST_COL] + [CATEGORYNAME_COL]
+    extra_cols = ", ".join([INDEX_COL] + sql_cols + [VARIANTS_COL, QUANTITY_COL])
     return f"""
     SELECT {SHOP_COL}, {DATE_COL}, {extra_cols}
     FROM `{table}`
@@ -127,14 +120,15 @@ def fetch_shops(_creds_hash: str, table: str) -> list:
     return sorted(df[SHOP_COL].dropna().tolist())
 
 
+
 # ─────────────────────────────────────────
-# WYLICZANIE PODKATEGORII Z categoryname
+# WYLICZANIE OSTATNIEGO SEGMENTU categoryname
 # ─────────────────────────────────────────
 
-def add_subcategory_column(df: pd.DataFrame) -> pd.DataFrame:
+def add_categoryname_last_column(df: pd.DataFrame) -> pd.DataFrame:
     """Z 'Męskie/Buty/Buty lifestyle' wyciąga tylko ostatni człon: 'Buty lifestyle'."""
     if CATEGORYNAME_COL in df.columns:
-        df[SUBCATEGORY_COL] = (
+        df[CATEGORYNAME_LAST_COL] = (
             df[CATEGORYNAME_COL]
             .astype(str)
             .str.split("/")
@@ -156,7 +150,7 @@ def fetch_period(_creds_hash: str, table: str, start: date, end: date) -> pd.Dat
     df      = job.result().to_dataframe()
     if DATE_COL in df.columns:
         df[DATE_COL] = pd.to_datetime(df[DATE_COL]).dt.date
-    df = add_subcategory_column(df)
+    df = add_categoryname_last_column(df)
     return df
 
 
@@ -505,7 +499,7 @@ df_year_s = df_year[df_year[SHOP_COL] == selected_shop].copy()
 # ─────────────────────────────────────────
 st.markdown("### 🎛️ Filtry")
 
-ALL_FILTER_COLS = CATEGORY_COLS  # zawiera 'podkategoria' zamiast surowego categoryname
+ALL_FILTER_COLS = CATEGORY_COLS
 filter_cols = [c for c in ALL_FILTER_COLS if c in df_cur_s.columns]
 
 active_filters = {}
@@ -515,9 +509,8 @@ if filter_cols:
     for i, fc in enumerate(filter_cols):
         with fcols[i % n_filter_cols]:
             unique_vals = sorted(df_cur_s[fc].dropna().unique().tolist())
-            label = "kategoria" if fc == SUBCATEGORY_COL else fc
             selected = st.multiselect(
-                label,
+                f"{fc}",
                 options=unique_vals,
                 default=[],
                 key=f"filter_{fc}",
