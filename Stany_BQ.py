@@ -1,9 +1,3 @@
-"""
-BQ Viewer – raport porównawczy (sklep × wszystkie zmienne)
-Zoptymalizowane pobieranie + samo MPK + stałe podsumowanie okresu + ukryte koszty.
-Wymiar 'categoryname' zastąpiony przez 'brand'.
-"""
-
 import os, json, pathlib
 from datetime import date, timedelta
 import concurrent.futures
@@ -20,8 +14,8 @@ from google.oauth2 import service_account
 
 TODAY  = date.today()
 
-# Zamieniono 'categoryname' na 'brand'
-CATEGORY_COLS = ["brand", "gender", "season", "seasonality", "type"]
+# Dodano kolumnę 'Rodzaj' do listy wyświetlanych i filtrowanych kolumn kategoryzujących
+CATEGORY_COLS = ["brand", "gender", "season", "seasonality", "type", "Rodzaj"]
 DATE_COL      = "event_date"
 SHOP_COL      = "shop_name"
 INDEX_COL     = "index"
@@ -149,7 +143,9 @@ def fetch_shops(_creds_hash: str, table: str) -> list:
 # ─────────────────────────────────────────
 
 def build_query(table: str, start: date, end: date, shop_name: str = None) -> str:
-    extra_cols = ", ".join([INDEX_COL] + CATEGORY_COLS + [VARIANTS_COL, QUANTITY_COL])
+    # Wykluczamy 'Rodzaj' z zapytania sql, bo tworzymy go lokalnie z 'categoryname'
+    sql_cols = [c for c in CATEGORY_COLS if c != "Rodzaj"] + ["categoryname"]
+    extra_cols = ", ".join([INDEX_COL] + sql_cols + [VARIANTS_COL, QUANTITY_COL])
     shop_filter = f"AND {SHOP_COL} = '{shop_name}'" if shop_name else ""
     
     return f"""
@@ -160,14 +156,30 @@ def build_query(table: str, start: date, end: date, shop_name: str = None) -> st
     """
 
 
+# Funkcja wyciągająca ostatnią wartość po znaku '/' (np. z Męskie/Buty/Buty lifestyle robi Buty lifestyle)
+def extract_rodzaj(val):
+    if pd.isna(val) or not isinstance(val, str):
+        return "Brak"
+    parts = val.split("/")
+    return parts[-1].strip() if parts else val
+
+
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_period(_creds_hash: str, table: str, start: date, end: date, shop_name: str) -> pd.DataFrame:
     project = parse_project(table)
     client  = bigquery.Client(credentials=get_credentials(), project=project)
     job     = client.query(build_query(table, start, end, shop_name))
     df      = job.result().to_dataframe()
+    
     if DATE_COL in df.columns:
         df[DATE_COL] = pd.to_datetime(df[DATE_COL]).dt.date
+        
+    # Tworzenie nowej kolumny Rodzaj na podstawie pobranego pola categoryname
+    if "categoryname" in df.columns:
+        df["Rodzaj"] = df["categoryname"].apply(extract_rodzaj)
+    else:
+        df["Rodzaj"] = "Brak"
+        
     return df
 
 
@@ -491,7 +503,8 @@ filter_cols = [c for c in CATEGORY_COLS if c in df_cur_s.columns]
 
 active_filters = {}
 if filter_cols:
-    n_filter_cols = min(len(filter_cols), 5)
+    # Zwiększono siatkę kolumn Streamlit do maks 6, aby ładnie pomieścić "Rodzaj"
+    n_filter_cols = min(len(filter_cols), 6)
     fcols = st.columns(n_filter_cols)
     for i, fc in enumerate(filter_cols):
         with fcols[i % n_filter_cols]:
